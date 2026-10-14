@@ -25,7 +25,7 @@ class StaffResource extends Resource
 
     protected static ?string $pluralModelLabel = 'پرسنل';
 
-    protected static ?string $navigationGroup = 'NIL';
+    protected static ?string $navigationGroup = 'Dentistry';
 
     public static function form(Form $form): Form
     {

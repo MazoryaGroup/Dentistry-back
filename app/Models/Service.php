@@ -5,6 +5,7 @@ namespace App\Models;
 use Illuminate\Database\Eloquent\Model;
 use Illuminate\Database\Eloquent\Relations\BelongsToMany;
 use Illuminate\Database\Eloquent\Relations\HasMany;
+use Illuminate\Database\Eloquent\Relations\HasOne;
 
 class Service extends Model
 {
@@ -13,13 +14,14 @@ class Service extends Model
     protected $fillable = [
         'name',
         'description',
+        'title_2',
+        'description_2',
         'duration',
         'price',
         'deposit_amount',
         'is_active',
         'image_1',
         'image_2',
-
     ];
 
     protected $casts = [
@@ -29,9 +31,47 @@ class Service extends Model
         'is_active' => 'boolean',
     ];
 
+    protected static function booted(): void
+    {
+        static::saved(function (Service $service) {
+            $service->translations()->updateOrCreate(
+                ['locale' => 'fa'],
+                [
+                    'title_1' => $service->name,
+                    'description_1' => $service->description,
+                    'title_2' => $service->title_2,
+                    'description_2' => $service->description_2,
+                ]
+            );
+        });
+    }
+
     /*
     |--------------------------------------------------------------------------
-    | Relations
+    | Translations
+    |--------------------------------------------------------------------------
+    */
+
+    public function translations(): HasMany
+    {
+        return $this->hasMany(ServiceTranslation::class);
+    }
+
+    public function persianTranslation(): HasOne
+    {
+        return $this->hasOne(ServiceTranslation::class)
+            ->where('locale', 'fa');
+    }
+
+    public function englishTranslation(): HasOne
+    {
+        return $this->hasOne(ServiceTranslation::class)
+            ->where('locale', 'en');
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Existing NIL Relations
     |--------------------------------------------------------------------------
     */
 

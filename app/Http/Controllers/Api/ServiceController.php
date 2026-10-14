@@ -5,56 +5,49 @@ namespace App\Http\Controllers\Api;
 use App\Http\Controllers\Controller;
 use App\Models\Service;
 use Illuminate\Http\JsonResponse;
+use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Storage;
 
 class ServiceController extends Controller
 {
     /**
-     * Get all active services.
+     * List active services.
      */
-    public function index(): JsonResponse
+    public function index(Request $request): JsonResponse
     {
+        $locale = $this->resolveLocale($request);
+
         $services = Service::query()
+            ->with('translations')
             ->where('is_active', true)
             ->orderBy('id')
-            ->get([
-                'id',
-                'name',
-                'description',
-                'duration',
-                'price',
-                'deposit_amount',
-                'image_1',
-                'image_2',
-            ])
-            ->map(fn (Service $service) => $this->formatService($service));
+            ->get()
+            ->map(
+                fn (Service $service) =>
+                $this->formatService($service, $locale)
+            );
 
         return response()->json([
             'status' => true,
             'statusCode' => 200,
             'message' => 'Services retrieved successfully.',
             'data' => $services,
-        ], 200);
+        ]);
     }
 
     /**
-     * Get single active service.
+     * Show a single active service.
      */
-    public function show(int $id): JsonResponse
-    {
+    public function show(
+        Request $request,
+        int $id
+    ): JsonResponse {
+        $locale = $this->resolveLocale($request);
+
         $service = Service::query()
+            ->with('translations')
             ->where('is_active', true)
-            ->where('id', $id)
-            ->first([
-                'id',
-                'name',
-                'description',
-                'duration',
-                'price',
-                'deposit_amount',
-                'image_1',
-                'image_2',
-            ]);
+            ->find($id);
 
         if (!$service) {
             return response()->json([
@@ -69,33 +62,105 @@ class ServiceController extends Controller
             'status' => true,
             'statusCode' => 200,
             'message' => 'Service retrieved successfully.',
-            'data' => $this->formatService($service),
-        ], 200);
+            'data' => $this->formatService(
+                $service,
+                $locale
+            ),
+        ]);
     }
 
     /**
-     * Format service response.
+     * Resolve requested language.
      */
-    private function formatService(Service $service): array
+    private function resolveLocale(Request $request): string
     {
+        $locale = $request->query('lang', 'fa');
+
+        return in_array($locale, ['fa', 'en'], true)
+            ? $locale
+            : 'fa';
+    }
+
+    /**
+     * Format localized service.
+     */
+    private function formatService(
+        Service $service,
+        string $locale
+    ): array {
+        $translation = $service->translations
+            ->firstWhere('locale', $locale);
+
+        $persian = $service->translations
+            ->firstWhere('locale', 'fa');
+
+        // Fallback to Persian for missing translations.
+        $localized = function (
+            string $field,
+                   $legacy = null
+        ) use ($translation, $persian) {
+            $values = [
+                $translation?->{$field},
+                $persian?->{$field},
+                $legacy,
+            ];
+
+            foreach ($values as $value) {
+                if (
+                    $value !== null &&
+                    trim((string) $value) !== ''
+                ) {
+                    return $value;
+                }
+            }
+
+            return null;
+        };
+
+        $title1 = $localized('title_1', $service->name);
+
+        $description1 = $localized(
+            'description_1',
+            $service->description
+        );
+
         return [
             'id' => $service->id,
-            'name' => $service->name,
-            'description' => $service->description,
+            'locale' => $locale,
+
+            // Compatibility with old API
+            'name' => $title1,
+            'description' => $description1,
+
+            // Section 1
+            'title_1' => $title1,
+            'description_1' => $description1,
+
+            'image_1_url' => $service->image_1
+                ? Storage::disk('api_public')
+                    ->url($service->image_1)
+                : null,
+
+            // Section 2
+            'title_2' => $localized(
+                'title_2',
+                $service->title_2
+            ),
+
+            'description_2' => $localized(
+                'description_2',
+                $service->description_2
+            ),
+
+            'image_2_url' => $service->image_2
+                ? Storage::disk('api_public')
+                    ->url($service->image_2)
+                : null,
+
+            // Shared booking information
             'duration' => $service->duration,
             'price' => $service->price,
             'deposit_amount' => $service->deposit_amount,
-
-            'image_1' => $service->image_1,
-            'image_2' => $service->image_2,
-
-            'image_1_url' => $service->image_1
-                ? Storage::disk('api_public')->url($service->image_1)
-                : null,
-
-            'image_2_url' => $service->image_2
-                ? Storage::disk('api_public')->url($service->image_2)
-                : null,
         ];
     }
 }

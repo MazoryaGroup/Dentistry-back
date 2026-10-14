@@ -27,7 +27,7 @@ class BookingResource extends Resource
 
     protected static ?string $pluralModelLabel = 'رزروها';
 
-    protected static ?string $navigationGroup = 'NIL';
+    protected static ?string $navigationGroup = 'Dentistry';
 
     /*
     |--------------------------------------------------------------------------

@@ -28,12 +28,13 @@ class ClientResource extends Resource
     protected static ?string $model = Client::class;
 
     protected static ?string $navigationIcon = 'heroicon-o-users';
-    protected static ?string $navigationLabel = 'مشتری ';
+    protected static ?string $navigationLabel = 'بیماران ';
     protected static ?string $pluralLabel = 'کاربران';
+    protected static ?string $navigationGroup = 'Dentistry';
 
 
     protected static ?string $slug = 'clients';
-    protected static ?string $modelLabel = 'کاربر';
+    protected static ?string $modelLabel = 'بیمار';
 
     public static function form(Form $form): Form
     {
