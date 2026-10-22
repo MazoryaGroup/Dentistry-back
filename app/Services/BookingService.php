@@ -2,6 +2,7 @@
 
 namespace App\Services;
 
+use App\Models\AccountingAuditLog;
 use App\Models\Booking;
 use App\Models\BookingHold;
 use App\Models\BookingService as BookingServiceModel;
@@ -10,16 +11,26 @@ use App\Models\DiscountUsage;
 use App\Models\Payment;
 use App\Models\Service;
 use App\Models\Staff;
-use App\Services\ReferralRewardService;
 use Carbon\Carbon;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Validation\ValidationException;
-use App\Models\AccountingAuditLog;
 use Illuminate\Support\Facades\Log;
+use Illuminate\Validation\ValidationException;
 use Morilog\Jalali\Jalalian;
 
 class BookingService
 {
+    private const RELATIONS = [
+        'bookingServices.service',
+        'bookingServices.staff',
+        'payments',
+    ];
+
+    /*
+    |--------------------------------------------------------------------------
+    | Create Booking
+    |--------------------------------------------------------------------------
+    */
+
     public function createBooking(
         int $clientId,
         string $date,
@@ -42,12 +53,6 @@ class BookingService
                 ]);
             }
 
-            /*
-            |--------------------------------------------------------------------------
-            | Discount Code and Referral Reward cannot be used together
-            |--------------------------------------------------------------------------
-            */
-
             if (
                 $discountCode !== null &&
                 trim($discountCode) !== '' &&
@@ -59,87 +64,68 @@ class BookingService
                 ]);
             }
 
-            /*
-            |--------------------------------------------------------------------------
-            | Initial Variables
-            |--------------------------------------------------------------------------
-            */
+            // Serialize competing bookings.
+            $this->lockClient($clientId);
 
-            $bookingServices = [];
-            $pendingServices = [];
+            $this->lockStaff(
+                array_column($services, 'staff_id')
+            );
 
-            $bookingStart = null;
-            $bookingEnd = null;
-
-            $subtotal = 0;
-            $discountAmount = 0;
-            $totalAmount = 0;
-            $depositAmount = 0;
-
-            $availabilityService = app(
+            $availability = app(
                 BookingAvailabilityService::class
             );
 
+            $items = [];
+            $firstStart = null;
+            $lastEnd = null;
+
+            $subtotal = 0.0;
+            $depositAmount = 0.0;
+
             /*
             |--------------------------------------------------------------------------
-            | Validate Booking Services
+            | Validate Services
             |--------------------------------------------------------------------------
             */
 
             foreach ($services as $item) {
+                $serviceId = (int) (
+                    $item['service_id'] ?? 0
+                );
 
-                $serviceId = (int) ($item['service_id'] ?? 0);
-                $staffId = (int) ($item['staff_id'] ?? 0);
+                $staffId = (int) (
+                    $item['staff_id'] ?? 0
+                );
+
                 $startTime = $item['start_time'] ?? null;
 
-                if (!$serviceId || !$staffId || !$startTime) {
+                if (
+                    !$serviceId ||
+                    !$staffId ||
+                    !is_string($startTime)
+                ) {
                     throw ValidationException::withMessages([
                         'services' =>
                             'Each service must have service_id, staff_id and start_time.',
                     ]);
                 }
 
-                /*
-                |--------------------------------------------------------------------------
-                | Check Service
-                |--------------------------------------------------------------------------
-                */
-
                 $service = Service::query()
-                    ->where('id', $serviceId)
+                    ->whereKey($serviceId)
                     ->where('is_active', true)
                     ->first();
-
-                if (!$service) {
-                    throw ValidationException::withMessages([
-                        'services' =>
-                            "Service {$serviceId} is not available.",
-                    ]);
-                }
-
-                /*
-                |--------------------------------------------------------------------------
-                | Check Staff
-                |--------------------------------------------------------------------------
-                */
 
                 $staff = Staff::query()
-                    ->where('id', $staffId)
+                    ->whereKey($staffId)
                     ->where('is_active', true)
                     ->first();
 
-                if (!$staff) {
+                if (!$service || !$staff) {
                     throw ValidationException::withMessages([
                         'services' =>
-                            "Staff {$staffId} is not available.",
+                            'The selected service or staff member is unavailable.',
                     ]);
                 }
-
-                /*
-                |--------------------------------------------------------------------------
-                | Check Staff Service
-                |--------------------------------------------------------------------------
-                */
 
                 $staffService = $staff->staffServices()
                     ->where('service_id', $serviceId)
@@ -149,9 +135,16 @@ class BookingService
                 if (!$staffService) {
                     throw ValidationException::withMessages([
                         'services' =>
-                            "This staff member cannot perform service {$serviceId}.",
+                            "Staff {$staffId} cannot perform service {$serviceId}.",
                     ]);
                 }
+
+                /*
+                |--------------------------------------------------------------------------
+                | Pricing
+                |--------------------------------------------------------------------------
+                | Keep current NIL pricing behaviour.
+                */
 
                 $duration = (int) $service->duration;
                 $price = (float) $service->price;
@@ -166,238 +159,166 @@ class BookingService
 
                 /*
                 |--------------------------------------------------------------------------
-                | Validate Start Time
+                | Date and Time
                 |--------------------------------------------------------------------------
                 */
 
-                try {
-                    $start = Carbon::createFromFormat(
-                        '!H:i',
-                        $startTime
-                    );
-                } catch (\Throwable $e) {
-                    throw ValidationException::withMessages([
-                        'services' =>
-                            "Invalid start time: {$startTime}.",
-                    ]);
-                }
-
-                if ($start->format('H:i') !== $startTime) {
-                    throw ValidationException::withMessages([
-                        'services' =>
-                            "Invalid start time: {$startTime}.",
-                    ]);
-                }
-
-                $end = $start->copy()->addMinutes($duration);
-
-                if (!$start->isSameDay($end)) {
-                    throw ValidationException::withMessages([
-                        'services' =>
-                            'Service cannot extend into the next day.',
-                    ]);
-                }
-
-                $normalizedStartTime = $start->format('H:i:s');
-                $normalizedEndTime = $end->format('H:i:s');
-
-                /*
-                |--------------------------------------------------------------------------
-                | Prevent Booking in the Past
-                |--------------------------------------------------------------------------
-                */
-
-                $serviceDateTime = Carbon::createFromFormat(
-                    '!Y-m-d H:i:s',
-                    $date . ' ' . $normalizedStartTime
+                $start = $this->strictDateTime(
+                    $date,
+                    $startTime,
+                    'services'
                 );
 
-                if ($serviceDateTime->lte(now())) {
+                $end = $start->copy()
+                    ->addMinutes($duration);
+
+                if ($end->format('Y-m-d') !== $date) {
                     throw ValidationException::withMessages([
                         'services' =>
-                            "The selected time {$startTime} must be in the future.",
+                            'A service cannot extend into the next day.',
                     ]);
                 }
 
+                if ($start->lte(now())) {
+                    throw ValidationException::withMessages([
+                        'services' =>
+                            'The selected appointment time must be in the future.',
+                    ]);
+                }
+
+                $startString = $start->format('H:i:s');
+                $endString = $end->format('H:i:s');
+
                 /*
                 |--------------------------------------------------------------------------
-                | Check Staff Availability
+                | Staff Availability
                 |--------------------------------------------------------------------------
                 */
 
-                $isAvailable = $availabilityService->isTimeAvailable(
+                if (!$availability->isTimeAvailable(
                     $staffId,
                     $date,
-                    $normalizedStartTime,
-                    $normalizedEndTime
-                );
-
-                if (!$isAvailable) {
+                    $startString,
+                    $endString
+                )) {
                     throw ValidationException::withMessages([
                         'services' =>
-                            "The selected time {$startTime} is not available for service {$serviceId}.",
+                            "Time {$startTime} is unavailable for service {$serviceId}.",
                     ]);
                 }
 
                 /*
-|--------------------------------------------------------------------------
-| Prevent Client Overlap Across Different Bookings
-|--------------------------------------------------------------------------
-*/
-
-                $hasClientConflict = BookingServiceModel::query()
-                    ->whereHas('booking', function ($query) use ($clientId, $date) {
-                        $query->where('client_id', $clientId)
-                            ->whereDate('booking_date', $date)
-                            ->whereNotIn('status', [
-                                'cancelled',
-                                'rejected',
-                                'no_show',
-                            ]);
-                    })
-                    ->where('start_time', '<', $normalizedEndTime)
-                    ->where('end_time', '>', $normalizedStartTime)
-                    ->exists();
-
-                if ($hasClientConflict) {
-                    throw ValidationException::withMessages([
-                        'services' =>
-                            'You already have another booking at the selected time.',
-                    ]);
-                }
-                /*
                 |--------------------------------------------------------------------------
-                | Prevent Overlapping Services for Same Client
+                | Client Conflict
                 |--------------------------------------------------------------------------
-                |
-                | Different staff members are allowed,
-                | but the client's services cannot overlap.
-                |
                 */
 
-                foreach ($pendingServices as $pendingService) {
+                $conflict = BookingServiceModel::query()
+                    ->whereHas(
+                        'booking',
+                        function ($query) use (
+                            $clientId,
+                            $date
+                        ) {
+                            $query
+                                ->where('client_id', $clientId)
+                                ->whereDate('booking_date', $date)
+                                ->whereNotIn('status', [
+                                    'cancelled',
+                                    'rejected',
+                                    'no_show',
+                                ]);
+                        }
+                    )
+                    ->where('start_time', '<', $endString)
+                    ->where('end_time', '>', $startString)
+                    ->exists();
 
-                    $pendingStart = Carbon::createFromFormat(
-                        '!H:i:s',
-                        $pendingService['start_time']
-                    );
+                if ($conflict) {
+                    throw ValidationException::withMessages([
+                        'services' =>
+                            'You already have another booking at this time.',
+                    ]);
+                }
 
-                    $pendingEnd = Carbon::createFromFormat(
-                        '!H:i:s',
-                        $pendingService['end_time']
-                    );
+                /*
+                |--------------------------------------------------------------------------
+                | Same Booking Overlap
+                |--------------------------------------------------------------------------
+                */
 
-                    $overlaps =
-                        $start->lt($pendingEnd) &&
-                        $end->gt($pendingStart);
-
-                    if ($overlaps) {
+                foreach ($items as $previous) {
+                    if (
+                        $startString < $previous['end_time'] &&
+                        $endString > $previous['start_time']
+                    ) {
                         throw ValidationException::withMessages([
                             'services' =>
-                                'Selected services cannot overlap, even with different staff members.',
+                                'Selected services cannot overlap for the same patient.',
                         ]);
                     }
                 }
 
                 /*
                 |--------------------------------------------------------------------------
-                | Calculate Deposit
+                | Calculate Totals
                 |--------------------------------------------------------------------------
                 */
 
+                $firstStart = $firstStart === null
+                    ? $startString
+                    : min($firstStart, $startString);
 
-
-                /*
-                |--------------------------------------------------------------------------
-                | Calculate Booking Start and End
-                |--------------------------------------------------------------------------
-                */
-
-                if (
-                    $bookingStart === null ||
-                    $normalizedStartTime < $bookingStart
-                ) {
-                    $bookingStart = $normalizedStartTime;
-                }
-
-                if (
-                    $bookingEnd === null ||
-                    $normalizedEndTime > $bookingEnd
-                ) {
-                    $bookingEnd = $normalizedEndTime;
-                }
-
-                /*
-                |--------------------------------------------------------------------------
-                | Calculate Amounts
-                |--------------------------------------------------------------------------
-                */
+                $lastEnd = $lastEnd === null
+                    ? $endString
+                    : max($lastEnd, $endString);
 
                 $subtotal += $price;
                 $depositAmount += $deposit;
 
-                /*
-                |--------------------------------------------------------------------------
-                | Prepare Booking Service
-                |--------------------------------------------------------------------------
-                */
-
-                $bookingServiceData = [
+                $items[] = [
                     'service_id' => $serviceId,
                     'staff_id' => $staffId,
-                    'start_time' => $normalizedStartTime,
-                    'end_time' => $normalizedEndTime,
+                    'start_time' => $startString,
+                    'end_time' => $endString,
                     'duration' => $duration,
                     'price' => $price,
                     'deposit_amount' => $deposit,
                 ];
-
-                $pendingServices[] = $bookingServiceData;
-                $bookingServices[] = $bookingServiceData;
             }
 
             /*
             |--------------------------------------------------------------------------
-            | Discount / Referral Reward
+            | Discount Code
             |--------------------------------------------------------------------------
             */
 
             $discount = null;
-            $referralRewardService = null;
-            $referralRewardResult = null;
+            $discountAmount = 0.0;
 
-            /*
-            |--------------------------------------------------------------------------
-            | Generic Discount Code
-            |--------------------------------------------------------------------------
-            */
+            $rewardService = null;
+            $rewardResult = null;
 
             if (
                 $discountCode !== null &&
                 trim($discountCode) !== ''
             ) {
-                $normalizedDiscountCode = strtoupper(
+                $normalizedCode = strtoupper(
                     trim($discountCode)
                 );
 
                 $discount = DiscountCode::query()
                     ->whereRaw(
                         'UPPER(code) = ?',
-                        [$normalizedDiscountCode]
+                        [$normalizedCode]
                     )
                     ->lockForUpdate()
                     ->first();
 
-                if (!$discount) {
-                    throw ValidationException::withMessages([
-                        'discount_code' => 'Invalid discount code.',
-                    ]);
-                }
-
-                if (!$discount->is_active) {
+                if (!$discount || !$discount->is_active) {
                     throw ValidationException::withMessages([
                         'discount_code' =>
-                            'This discount code is inactive.',
+                            'Invalid or inactive discount code.',
                     ]);
                 }
 
@@ -429,7 +350,7 @@ class BookingService
                 ) {
                     throw ValidationException::withMessages([
                         'discount_code' =>
-                            'The order amount is below the minimum amount required for this discount code.',
+                            'The order amount is below the discount minimum.',
                     ]);
                 }
 
@@ -444,55 +365,57 @@ class BookingService
                 }
 
                 if ($discount->usage_limit_per_client !== null) {
-
-                    $clientUsageCount = DiscountUsage::query()
+                    $usageCount = DiscountUsage::query()
                         ->where('discount_code_id', $discount->id)
                         ->where('client_id', $clientId)
-                        ->whereIn('status', ['reserved', 'consumed'])
+                        ->whereIn('status', [
+                            'reserved',
+                            'consumed',
+                        ])
                         ->count();
 
                     if (
-                        $clientUsageCount >=
+                        $usageCount >=
                         $discount->usage_limit_per_client
                     ) {
                         throw ValidationException::withMessages([
                             'discount_code' =>
-                                'You have already reached the usage limit for this discount code.',
+                                'You have reached the usage limit for this discount.',
                         ]);
                     }
                 }
 
-                $discountValue = (float) $discount->value;
+                $value = (float) $discount->value;
 
-                if ($discountValue <= 0 || (
-                        $discount->type === 'percentage' && $discountValue > 100
-                    )) {
+                if (
+                    $value <= 0 ||
+                    (
+                        $discount->type === 'percentage' &&
+                        $value > 100
+                    )
+                ) {
                     throw ValidationException::withMessages([
-                        'discount_code' => 'Invalid discount value.',
+                        'discount_code' =>
+                            'Invalid discount value.',
                     ]);
                 }
 
-                if ($discount->type === 'percentage') {
-                    $discountAmount = $subtotal * ($discountValue / 100);
-                } else {
-                    // Keep the existing fixed-amount discount type compatible.
-                    $discountAmount = $discountValue;
+                $discountAmount =
+                    $discount->type === 'percentage'
+                        ? $subtotal * ($value / 100)
+                        : $value;
+
+                if ($discount->max_discount_amount !== null) {
+                    $discountAmount = min(
+                        $discountAmount,
+                        (float) $discount->max_discount_amount
+                    );
                 }
 
-                if (
-                    $discount->max_discount_amount !== null &&
-                    $discountAmount >
-                    (float) $discount->max_discount_amount
-                ) {
-                    $discountAmount =
-                        (float) $discount->max_discount_amount;
-                }
-
-                if ($discountAmount > $subtotal) {
-                    $discountAmount = $subtotal;
-                }
-
-                $discountAmount = round($discountAmount, 2);
+                $discountAmount = round(
+                    min($subtotal, $discountAmount),
+                    2
+                );
             }
 
             /*
@@ -502,20 +425,18 @@ class BookingService
             */
 
             if ($useReferralReward) {
-
-                $referralRewardService = app(
+                $rewardService = app(
                     ReferralRewardService::class
                 );
 
-                $referralRewardResult =
-                    $referralRewardService->calculateDiscount(
-                        clientId: $clientId,
-                        orderAmount: $subtotal
-                    );
+                $rewardResult = $rewardService->calculateDiscount(
+                    clientId: $clientId,
+                    orderAmount: $subtotal
+                );
 
                 if (
-                    !$referralRewardResult['eligible'] ||
-                    !$referralRewardResult['rule']
+                    !($rewardResult['eligible'] ?? false) ||
+                    !($rewardResult['rule'] ?? null)
                 ) {
                     throw ValidationException::withMessages([
                         'use_referral_reward' =>
@@ -523,27 +444,32 @@ class BookingService
                     ]);
                 }
 
-                $discountAmount =
-                    (float) $referralRewardResult['discount_amount'];
+                $discountAmount = (float)
+                $rewardResult['discount_amount'];
             }
 
             /*
             |--------------------------------------------------------------------------
-            | Final Total
+            | Final Amount
             |--------------------------------------------------------------------------
             */
 
-            $totalAmount = $subtotal - $discountAmount;
+            $discountAmount = round(
+                min($subtotal, max(0, $discountAmount)),
+                2
+            );
 
-            if ($totalAmount < 0) {
-                $totalAmount = 0;
-            }
+            $totalAmount = round(
+                max(0, $subtotal - $discountAmount),
+                2
+            );
 
-            $totalAmount = round($totalAmount, 2);
+            $depositAmount = round(
+                min(max(0, $depositAmount), $totalAmount),
+                2
+            );
 
-            // Never request a deposit larger than the final payable amount.
-            $depositAmount = round(min(max(0, $depositAmount), $totalAmount), 2);
-            $isFreeBooking = $totalAmount <= 0;
+            $isFree = $totalAmount <= 0;
 
             /*
             |--------------------------------------------------------------------------
@@ -554,51 +480,44 @@ class BookingService
             $booking = Booking::create([
                 'client_id' => $clientId,
                 'booking_date' => $date,
-                'start_time' => $bookingStart,
-                'end_time' => $bookingEnd,
-
+                'start_time' => $firstStart,
+                'end_time' => $lastEnd,
                 'subtotal' => $subtotal,
                 'discount_amount' => $discountAmount,
                 'total_amount' => $totalAmount,
-
                 'deposit_amount' => $depositAmount,
                 'paid_amount' => 0,
-
-                'status' => $isFreeBooking ? 'confirmed' : 'awaiting_payment',
-                'payment_status' => $isFreeBooking ? 'paid' : 'pending',
-
+                'status' => $isFree
+                    ? 'confirmed'
+                    : 'awaiting_payment',
+                'payment_status' => $isFree
+                    ? 'paid'
+                    : 'pending',
                 'notes' => $notes,
             ]);
 
-            /*
-            |--------------------------------------------------------------------------
-            | Create Booking Services
-            |--------------------------------------------------------------------------
-            */
-
-            foreach ($bookingServices as $bookingService) {
+            foreach ($items as $item) {
                 BookingServiceModel::create([
                     'booking_id' => $booking->id,
-                    ...$bookingService,
+                    ...$item,
                 ]);
             }
 
             /*
             |--------------------------------------------------------------------------
-            | Record Generic Discount Usage
+            | Store Discount Usage
             |--------------------------------------------------------------------------
             */
 
-            if (
-                $discount &&
-                $discountAmount > 0
-            ) {
+            if ($discount && $discountAmount > 0) {
                 DiscountUsage::create([
                     'discount_code_id' => $discount->id,
                     'client_id' => $clientId,
                     'booking_id' => $booking->id,
                     'discount_amount' => $discountAmount,
-                    'status' => $isFreeBooking ? 'consumed' : 'reserved',
+                    'status' => $isFree
+                        ? 'consumed'
+                        : 'reserved',
                 ]);
 
                 $discount->increment('usage_count');
@@ -606,17 +525,17 @@ class BookingService
 
             /*
             |--------------------------------------------------------------------------
-            | Record Referral Reward Usage
+            | Store Referral Usage
             |--------------------------------------------------------------------------
             */
 
             if (
                 $useReferralReward &&
-                $referralRewardResult &&
-                $referralRewardResult['eligible'] &&
-                $referralRewardResult['rule']
+                $rewardResult &&
+                $rewardResult['eligible'] &&
+                $rewardResult['rule']
             ) {
-                $referralRewardService->recordUsage(
+                $rewardService->recordUsage(
                     clientId: $clientId,
                     bookingId: $booking->id,
                     orderAmount: $subtotal
@@ -625,64 +544,37 @@ class BookingService
 
             /*
             |--------------------------------------------------------------------------
-            | Confirm fully discounted bookings without creating a payment
+            | Confirm Free Booking
             |--------------------------------------------------------------------------
             */
 
-            if ($isFreeBooking) {
+            if ($isFree) {
                 $booking->notifications()->firstOrCreate(
                     ['type' => 'booking_confirmed'],
                     [
                         'user_id' => null,
-                        'client_id' => $booking->client_id,
+                        'client_id' => $clientId,
                         'title' => 'Booking Confirmed',
-                        'message' => 'Your booking has been confirmed for '
-                            . $booking->booking_date->format('Y-m-d')
-                            . ' at ' . substr($booking->start_time, 0, 5) . '.',
+                        'message' =>
+                            'Your booking has been confirmed for '
+                            . $date
+                            . ' at '
+                            . substr($firstStart, 0, 5)
+                            . '.',
                         'is_read' => false,
                         'read_at' => null,
                     ]
                 );
 
-                // Send external SMS only after the transaction commits.
-                $confirmedBookingId = $booking->id;
-                DB::afterCommit(function () use ($confirmedBookingId) {
-                    try {
-                        $confirmedBooking = Booking::with('client')->find($confirmedBookingId);
-                        $client = $confirmedBooking?->client;
-
-                        if (!$confirmedBooking || !$client || empty($client->phone)) {
-                            return;
-                        }
-
-                        if ($confirmedBooking->smsLogs()
-                            ->where('type', 'booking_confirmed')
-                            ->where('status', 'sent')
-                            ->exists()) {
-                            return;
-                        }
-
-                        app(SmsService::class)->sendBookingConfirmed(
-                            phone: $client->phone,
-                            date: Jalalian::fromCarbon(
-                                $confirmedBooking->booking_date
-                            )->format('Y/m/d'),
-                            time: substr($confirmedBooking->start_time, 0, 5),
-                            booking: $confirmedBooking,
-                            client: $client
-                        );
-                    } catch (\Throwable $e) {
-                        Log::error('Free booking confirmation SMS failed', [
-                            'booking_id' => $confirmedBookingId,
-                            'error' => $e->getMessage(),
-                        ]);
-                    }
-                });
+                $this->sendSmsAfterCommit(
+                    $booking->id,
+                    'booking_confirmed'
+                );
             }
 
             /*
             |--------------------------------------------------------------------------
-            | Convert Booking Hold
+            | Convert Hold
             |--------------------------------------------------------------------------
             */
 
@@ -693,19 +585,17 @@ class BookingService
                     'status' => 'converted',
                 ]);
 
-            /*
-            |--------------------------------------------------------------------------
-            | Return Booking
-            |--------------------------------------------------------------------------
-            */
+            return $booking->load(self::RELATIONS);
 
-            return $booking->load([
-                'bookingServices.service',
-                'bookingServices.staff',
-                'payments',
-            ]);
-        });
+        }, 3);
     }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Cancel Booking
+    |--------------------------------------------------------------------------
+    */
+
     public function cancelBooking(
         int $bookingId,
         int $clientId,
@@ -716,8 +606,10 @@ class BookingService
             $clientId,
             $reason
         ) {
+            $this->lockClient($clientId);
+
             $booking = Booking::query()
-                ->where('id', $bookingId)
+                ->whereKey($bookingId)
                 ->where('client_id', $clientId)
                 ->lockForUpdate()
                 ->first();
@@ -728,6 +620,12 @@ class BookingService
                 ]);
             }
 
+            /*
+            |--------------------------------------------------------------------------
+            | Booking Status
+            |--------------------------------------------------------------------------
+            */
+
             if (in_array($booking->status, [
                 'cancelled',
                 'completed',
@@ -735,23 +633,20 @@ class BookingService
                 'no_show',
             ], true)) {
                 throw ValidationException::withMessages([
-                    'booking' => 'This booking cannot be cancelled.',
+                    'booking' =>
+                        'This booking cannot be cancelled.',
                 ]);
             }
 
-            $bookingStart = Carbon::createFromFormat(
-                'Y-m-d H:i:s',
-                $booking->booking_date->format('Y-m-d')
-                . ' '
-                . $booking->start_time
-            );
+            /*
+            |--------------------------------------------------------------------------
+            | 24 Hour Rule
+            |--------------------------------------------------------------------------
+            */
 
-            $hoursUntilBooking = now()->diffInHours(
-                $bookingStart,
-                false
-            );
+            $oldStart = $this->bookingStart($booking);
 
-            if ($hoursUntilBooking < 24) {
+            if ($oldStart->lt(now()->addHours(24))) {
                 throw ValidationException::withMessages([
                     'booking' =>
                         'Booking can only be cancelled at least 24 hours before the appointment.',
@@ -760,49 +655,63 @@ class BookingService
 
             /*
             |--------------------------------------------------------------------------
-            | Payment safety checks BEFORE cancellation
+            | Payment Checks
             |--------------------------------------------------------------------------
             */
 
             $hasPaidPayment = Payment::query()
                 ->where('booking_id', $booking->id)
-                ->whereIn('type', ['deposit', 'remaining'])
+                ->whereIn('type', [
+                    'deposit',
+                    'remaining',
+                ])
                 ->where('status', 'paid')
                 ->exists();
 
-            $hasUnresolvedGatewayPayment = Payment::query()
+            $hasUnresolvedPayment = Payment::query()
                 ->where('booking_id', $booking->id)
-                ->whereIn('type', ['deposit', 'remaining'])
+                ->whereIn('type', [
+                    'deposit',
+                    'remaining',
+                ])
                 ->where('status', 'pending')
                 ->where(function ($query) {
-                    $query->whereNotNull('authority')
+                    $query
+                        ->whereNotNull('authority')
                         ->orWhereNotNull('initiation_token');
                 })
                 ->exists();
 
-            if ($hasUnresolvedGatewayPayment) {
+            if ($hasUnresolvedPayment) {
                 throw ValidationException::withMessages([
-                    'booking' => 'An online payment is still pending verification. Please resolve it before cancelling.',
+                    'booking' =>
+                        'An online payment is still pending verification.',
                 ]);
             }
 
             /*
             |--------------------------------------------------------------------------
-            | Store old values for Audit Log
+            | Old Values
             |--------------------------------------------------------------------------
             */
 
             $oldValues = [
                 'status' => $booking->status,
-                'cancelled_at' => $booking->cancelled_at?->format('Y-m-d H:i:s'),
-                'cancellation_reason' => $booking->cancellation_reason,
-                'paid_amount' => (float) $booking->paid_amount,
-                'payment_status' => $booking->payment_status,
+                'cancelled_at' =>
+                    $booking->cancelled_at?->format(
+                        'Y-m-d H:i:s'
+                    ),
+                'cancellation_reason' =>
+                    $booking->cancellation_reason,
+                'paid_amount' =>
+                    (float) $booking->paid_amount,
+                'payment_status' =>
+                    $booking->payment_status,
             ];
 
             /*
             |--------------------------------------------------------------------------
-            | Cancel Booking
+            | Cancel
             |--------------------------------------------------------------------------
             */
 
@@ -814,35 +723,37 @@ class BookingService
 
             /*
             |--------------------------------------------------------------------------
-            | Release unpaid discount/referral reservations
+            | Release Unpaid Rewards
             |--------------------------------------------------------------------------
+            | Paid bookings are not automatically refunded.
             */
 
-            // A fully discounted confirmed booking has consumed its reward.
-            // Keep its usage record even if the booking is later cancelled.
             if (
                 (float) $booking->total_amount > 0 &&
-                !$hasPaidPayment &&
-                !$hasUnresolvedGatewayPayment
+                !$hasPaidPayment
             ) {
-                app(ReferralRewardService::class)->releaseUsage($booking->id);
-            }
+                app(ReferralRewardService::class)
+                    ->releaseUsage($booking->id);
 
-            // A fully discounted booking has already consumed its discount.
-            // Paid bookings retain consumed discounts until refund policy is defined.
-            if ((float) $booking->total_amount > 0 && !$hasPaidPayment) {
                 $discountUsage = DiscountUsage::query()
                     ->where('booking_id', $booking->id)
                     ->lockForUpdate()
                     ->first();
 
-                if ($discountUsage && $discountUsage->status === 'reserved') {
+                if (
+                    $discountUsage &&
+                    $discountUsage->status === 'reserved'
+                ) {
                     $discount = DiscountCode::query()
-                        ->whereKey($discountUsage->discount_code_id)
+                        ->whereKey(
+                            $discountUsage->discount_code_id
+                        )
                         ->lockForUpdate()
                         ->firstOrFail();
 
-                    $discountUsage->update(['status' => 'released']);
+                    $discountUsage->update([
+                        'status' => 'released',
+                    ]);
 
                     if ((int) $discount->usage_count > 0) {
                         $discount->decrement('usage_count');
@@ -852,7 +763,7 @@ class BookingService
 
             /*
             |--------------------------------------------------------------------------
-            | Release Active Holds
+            | Release Holds
             |--------------------------------------------------------------------------
             */
 
@@ -863,66 +774,24 @@ class BookingService
                     'status' => 'released',
                 ]);
 
-            $booking->refresh();
             /*
-|--------------------------------------------------------------------------
-| Client Notification
-|--------------------------------------------------------------------------
-*/
+            |--------------------------------------------------------------------------
+            | Notification
+            |--------------------------------------------------------------------------
+            */
 
             $booking->notifications()->create([
                 'user_id' => null,
-                'client_id' => $booking->client_id,
+                'client_id' => $clientId,
                 'type' => 'booking_cancelled',
                 'title' => 'Booking Cancelled',
-                'message' => 'Your booking has been cancelled successfully.',
+                'message' =>
+                    'Your booking has been cancelled successfully.',
                 'is_read' => false,
                 'read_at' => null,
             ]);
 
-            /*
-|--------------------------------------------------------------------------
-| Booking Cancelled SMS
-|--------------------------------------------------------------------------
-*/
-
-            $client = $booking->client;
-
-            if ($client && !empty($client->phone)) {
-
-                $smsAlreadySent = $booking->smsLogs()
-                    ->where('type', 'booking_cancelled')
-                    ->where('status', 'sent')
-                    ->exists();
-
-                if (!$smsAlreadySent) {
-                    try {
-                        app(SmsService::class)->sendBookingCancelled(
-                            phone: $client->phone,
-
-                            date: Jalalian::fromCarbon(
-                                $booking->booking_date
-                            )->format('Y/m/d'),
-
-                            time: Carbon::createFromFormat(
-                                'H:i:s',
-                                $booking->start_time
-                            )->format('H:i'),
-
-                            booking: $booking,
-                            client: $client
-                        );
-
-                    } catch (\Throwable $e) {
-
-                        Log::error('Booking cancelled SMS failed', [
-                            'booking_id' => $booking->id,
-                            'client_id' => $client->id,
-                            'error' => $e->getMessage(),
-                        ]);
-                    }
-                }
-            }
+            $booking->refresh();
 
             /*
             |--------------------------------------------------------------------------
@@ -930,45 +799,42 @@ class BookingService
             |--------------------------------------------------------------------------
             */
 
-            AccountingAuditLog::create([
-                'user_id' => null,
-
-                'action' => 'booking_cancelled',
-
-                'entity_type' => 'booking',
-                'entity_id' => $booking->id,
-
-                'booking_id' => $booking->id,
-                'client_id' => $booking->client_id,
-
-                'description' => $reason
-                    ?: 'Booking cancelled by client.',
-
-                'old_values' => $oldValues,
-
-                'new_values' => [
+            $this->audit(
+                $booking,
+                'booking_cancelled',
+                $reason ?: 'Booking cancelled by client.',
+                $oldValues,
+                [
                     'status' => $booking->status,
-                    'cancelled_at' => $booking->cancelled_at?->format('Y-m-d H:i:s'),
-                    'cancellation_reason' => $booking->cancellation_reason,
-                    'paid_amount' => (float) $booking->paid_amount,
-                    'payment_status' => $booking->payment_status,
+                    'cancelled_at' =>
+                        $booking->cancelled_at?->format(
+                            'Y-m-d H:i:s'
+                        ),
+                    'cancellation_reason' =>
+                        $booking->cancellation_reason,
+                    'paid_amount' =>
+                        (float) $booking->paid_amount,
+                    'payment_status' =>
+                        $booking->payment_status,
                     'refund_created' => false,
-                ],
+                ]
+            );
 
-                'ip_address' => request()?->ip(),
+            $this->sendSmsAfterCommit(
+                $booking->id,
+                'booking_cancelled'
+            );
 
-                'user_agent' => request()?->userAgent(),
+            return $booking->load(self::RELATIONS);
 
-                'created_at' => now(),
-            ]);
-
-            return $booking->load([
-                'bookingServices.service',
-                'bookingServices.staff',
-                'payments',
-            ]);
-        });
+        }, 3);
     }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Reschedule Booking
+    |--------------------------------------------------------------------------
+    */
 
     public function rescheduleBooking(
         int $bookingId,
@@ -982,14 +848,10 @@ class BookingService
             $newDate,
             $newStartTime
         ) {
-            /*
-            |--------------------------------------------------------------------------
-            | Find Booking
-            |--------------------------------------------------------------------------
-            */
+            $this->lockClient($clientId);
 
             $booking = Booking::query()
-                ->where('id', $bookingId)
+                ->whereKey($bookingId)
                 ->where('client_id', $clientId)
                 ->lockForUpdate()
                 ->first();
@@ -1002,7 +864,7 @@ class BookingService
 
             /*
             |--------------------------------------------------------------------------
-            | Check Booking Status
+            | Validate Status
             |--------------------------------------------------------------------------
             */
 
@@ -1013,22 +875,10 @@ class BookingService
                 'no_show',
             ], true)) {
                 throw ValidationException::withMessages([
-                    'booking' => 'This booking cannot be rescheduled.',
+                    'booking' =>
+                        'This booking cannot be rescheduled.',
                 ]);
             }
-
-            /*
-            |--------------------------------------------------------------------------
-            | Current Booking Date / Time
-            |--------------------------------------------------------------------------
-            */
-
-            $bookingStart = Carbon::createFromFormat(
-                'Y-m-d H:i:s',
-                $booking->booking_date->format('Y-m-d')
-                . ' '
-                . $booking->start_time
-            );
 
             /*
             |--------------------------------------------------------------------------
@@ -1036,12 +886,9 @@ class BookingService
             |--------------------------------------------------------------------------
             */
 
-            $hoursUntilBooking = now()->diffInHours(
-                $bookingStart,
-                false
-            );
+            $oldStart = $this->bookingStart($booking);
 
-            if ($hoursUntilBooking < 24) {
+            if ($oldStart->lt(now()->addHours(24))) {
                 throw ValidationException::withMessages([
                     'booking' =>
                         'Booking can only be rescheduled at least 24 hours before the appointment.',
@@ -1050,86 +897,31 @@ class BookingService
 
             /*
             |--------------------------------------------------------------------------
-            | Validate New Date
+            | Validate New Date/Time
             |--------------------------------------------------------------------------
             */
 
-            try {
-                $parsedNewDate = Carbon::createFromFormat(
-                    'Y-m-d',
-                    $newDate
-                );
-            } catch (\Throwable $e) {
-                throw ValidationException::withMessages([
-                    'booking_date' =>
-                        "Invalid booking date: {$newDate}.",
-                ]);
-            }
+            $newStart = $this->strictDateTime(
+                $newDate,
+                $newStartTime,
+                'start_time'
+            );
 
-            if ($parsedNewDate->format('Y-m-d') !== $newDate) {
-                throw ValidationException::withMessages([
-                    'booking_date' =>
-                        "Invalid booking date: {$newDate}.",
-                ]);
-            }
-
-            /*
-            |--------------------------------------------------------------------------
-            | Validate New Start Time
-            |--------------------------------------------------------------------------
-            */
-
-            try {
-                $newTime = Carbon::createFromFormat(
-                    'H:i',
-                    $newStartTime
-                );
-            } catch (\Throwable $e) {
+            if ($newStart->lte(now())) {
                 throw ValidationException::withMessages([
                     'start_time' =>
-                        "Invalid start time: {$newStartTime}.",
-                ]);
-            }
-
-            if ($newTime->format('H:i') !== $newStartTime) {
-                throw ValidationException::withMessages([
-                    'start_time' =>
-                        "Invalid start time: {$newStartTime}.",
-                ]);
-            }
-
-            /*
-            |--------------------------------------------------------------------------
-            | Prevent Rescheduling To Past
-            |--------------------------------------------------------------------------
-            */
-
-            try {
-                $newBookingDateTime = Carbon::createFromFormat(
-                    'Y-m-d H:i',
-                    $newDate . ' ' . $newStartTime
-                );
-            } catch (\Throwable $e) {
-                throw ValidationException::withMessages([
-                    'booking_date' =>
-                        'Invalid booking date or time.',
-                ]);
-            }
-
-            if ($newBookingDateTime->lte(now())) {
-                throw ValidationException::withMessages([
-                    'booking_date' =>
                         'The new booking date and time must be in the future.',
                 ]);
             }
 
             /*
             |--------------------------------------------------------------------------
-            | Get Booking Services
+            | Booking Services
             |--------------------------------------------------------------------------
             */
 
-            $bookingServices = $booking->bookingServices()
+            $bookingServices = $booking
+                ->bookingServices()
                 ->orderBy('start_time')
                 ->get();
 
@@ -1139,157 +931,183 @@ class BookingService
                 ]);
             }
 
-            /*
-            |--------------------------------------------------------------------------
-            | Save Old Values For Audit
-            |--------------------------------------------------------------------------
-            */
-
-            $oldValues = [
-                'booking_date' =>
-                    $booking->booking_date->format('Y-m-d'),
-
-                'start_time' =>
-                    $booking->start_time,
-
-                'end_time' =>
-                    $booking->end_time,
-
-                'status' =>
-                    $booking->status,
-
-                'payment_status' =>
-                    $booking->payment_status,
-
-                'paid_amount' =>
-                    (float) $booking->paid_amount,
-
-                'services' => $bookingServices
-                    ->map(function ($service) {
-                        return [
-                            'booking_service_id' =>
-                                $service->id,
-
-                            'service_id' =>
-                                $service->service_id,
-
-                            'staff_id' =>
-                                $service->staff_id,
-
-                            'start_time' =>
-                                $service->start_time,
-
-                            'end_time' =>
-                                $service->end_time,
-                        ];
-                    })
-                    ->values()
-                    ->toArray(),
-            ];
-
-            /*
-            |--------------------------------------------------------------------------
-            | Calculate Time Offset
-            |--------------------------------------------------------------------------
-            */
-
-            $oldBookingStart = Carbon::createFromFormat(
-                'H:i:s',
-                $booking->start_time
+            $this->lockStaff(
+                $bookingServices->pluck('staff_id')->all()
             );
 
-            $newBookingStart = Carbon::createFromFormat(
-                'H:i',
-                $newStartTime
-            );
+            $oldDate = $booking
+                ->booking_date
+                ->format('Y-m-d');
 
-            $offsetMinutes = $oldBookingStart->diffInMinutes(
-                $newBookingStart,
+            $offsetMinutes = (int) $oldStart->diffInMinutes(
+                $this->strictDateTime(
+                    $oldDate,
+                    $newStartTime,
+                    'start_time'
+                ),
                 false
             );
 
             /*
             |--------------------------------------------------------------------------
-            | Availability Service
+            | Old Values
             |--------------------------------------------------------------------------
             */
 
-            $availabilityService = app(
+            $oldValues = [
+                'booking_date' => $oldDate,
+                'start_time' => $booking->start_time,
+                'end_time' => $booking->end_time,
+                'status' => $booking->status,
+                'payment_status' => $booking->payment_status,
+                'paid_amount' =>
+                    (float) $booking->paid_amount,
+                'services' => $bookingServices
+                    ->map(fn ($item) => [
+                        'booking_service_id' => $item->id,
+                        'service_id' => $item->service_id,
+                        'staff_id' => $item->staff_id,
+                        'start_time' => $item->start_time,
+                        'end_time' => $item->end_time,
+                    ])
+                    ->values()
+                    ->toArray(),
+            ];
+
+            $availability = app(
                 BookingAvailabilityService::class
             );
 
-            $newBookingServices = [];
+            $updates = [];
 
             /*
             |--------------------------------------------------------------------------
-            | Check Every Service
+            | Validate Every Shifted Service
             |--------------------------------------------------------------------------
             */
 
             foreach ($bookingServices as $bookingService) {
+                $shiftedStart = $this->strictDateTime(
+                    $oldDate,
+                    $bookingService->start_time,
+                    'booking'
+                )->addMinutes($offsetMinutes);
 
-                $serviceStart = Carbon::createFromFormat(
-                    'H:i:s',
-                    $bookingService->start_time
-                );
+                $shiftedEnd = $this->strictDateTime(
+                    $oldDate,
+                    $bookingService->end_time,
+                    'booking'
+                )->addMinutes($offsetMinutes);
 
-                $serviceEnd = Carbon::createFromFormat(
-                    'H:i:s',
-                    $bookingService->end_time
-                );
-
-                $newServiceStart = $serviceStart
-                    ->copy()
-                    ->addMinutes($offsetMinutes);
-
-                $newServiceEnd = $serviceEnd
-                    ->copy()
-                    ->addMinutes($offsetMinutes);
-
-                $isAvailable = $availabilityService
-                    ->isTimeAvailable(
-                        $bookingService->staff_id,
-                        $newDate,
-                        $newServiceStart->format('H:i:s'),
-                        $newServiceEnd->format('H:i:s'),
-                        $booking->id
-                    );
-
-                if (!$isAvailable) {
+                if (
+                    $shiftedStart->format('Y-m-d') !== $oldDate ||
+                    $shiftedEnd->format('Y-m-d') !== $oldDate ||
+                    $shiftedEnd->lte($shiftedStart)
+                ) {
                     throw ValidationException::withMessages([
                         'booking' =>
-                            "The selected time {$newServiceStart->format('H:i')} is not available.",
+                            'Appointment services cannot extend into another day.',
                     ]);
                 }
 
-                $newBookingServices[] = [
-                    'id' =>
-                        $bookingService->id,
+                $startString = $shiftedStart->format('H:i:s');
+                $endString = $shiftedEnd->format('H:i:s');
 
-                    'service_id' =>
-                        $bookingService->service_id,
+                /*
+                |--------------------------------------------------------------------------
+                | Staff Availability
+                |--------------------------------------------------------------------------
+                */
 
-                    'staff_id' =>
-                        $bookingService->staff_id,
+                if (!$availability->isTimeAvailable(
+                    staffId: (int) $bookingService->staff_id,
+                    date: $newDate,
+                    startTime: $startString,
+                    endTime: $endString,
+                    ignoreBookingId: $booking->id,
+                    ignoreHoldBookingId: $booking->id
+                )) {
+                    throw ValidationException::withMessages([
+                        'booking' =>
+                            "The selected time {$startString} is unavailable.",
+                    ]);
+                }
 
-                    'start_time' =>
-                        $newServiceStart->format('H:i:s'),
+                /*
+                |--------------------------------------------------------------------------
+                | Patient Conflict
+                |--------------------------------------------------------------------------
+                */
 
-                    'end_time' =>
-                        $newServiceEnd->format('H:i:s'),
+                $clientConflict = BookingServiceModel::query()
+                    ->whereHas(
+                        'booking',
+                        function ($query) use (
+                            $clientId,
+                            $newDate,
+                            $bookingId
+                        ) {
+                            $query
+                                ->where('client_id', $clientId)
+                                ->where('id', '!=', $bookingId)
+                                ->whereDate(
+                                    'booking_date',
+                                    $newDate
+                                )
+                                ->whereNotIn('status', [
+                                    'cancelled',
+                                    'rejected',
+                                    'no_show',
+                                ]);
+                        }
+                    )
+                    ->where('start_time', '<', $endString)
+                    ->where('end_time', '>', $startString)
+                    ->exists();
+
+                if ($clientConflict) {
+                    throw ValidationException::withMessages([
+                        'booking' =>
+                            'You already have another booking at the selected time.',
+                    ]);
+                }
+
+                $updates[] = [
+                    'id' => $bookingService->id,
+                    'service_id' => $bookingService->service_id,
+                    'staff_id' => $bookingService->staff_id,
+                    'start_time' => $startString,
+                    'end_time' => $endString,
                 ];
             }
 
             /*
             |--------------------------------------------------------------------------
-            | Calculate New Booking End
+            | Final Booking End
             |--------------------------------------------------------------------------
             */
 
-            $newBookingEnd = Carbon::createFromFormat(
-                'H:i:s',
-                $booking->end_time
+            $shiftedBookingEnd = $this->strictDateTime(
+                $oldDate,
+                $booking->end_time,
+                'booking'
             )->addMinutes($offsetMinutes);
+
+            if (
+                $shiftedBookingEnd->format('Y-m-d') !== $oldDate ||
+                $shiftedBookingEnd->lte(
+                    $this->strictDateTime(
+                        $oldDate,
+                        $newStartTime,
+                        'start_time'
+                    )
+                )
+            ) {
+                throw ValidationException::withMessages([
+                    'booking' =>
+                        'Appointment cannot extend into another day.',
+                ]);
+            }
 
             /*
             |--------------------------------------------------------------------------
@@ -1298,205 +1116,294 @@ class BookingService
             */
 
             $booking->update([
-                'booking_date' =>
-                    $newDate,
-
-                'start_time' =>
-                    $newBookingStart->format('H:i:s'),
-
+                'booking_date' => $newDate,
+                'start_time' => $newStart->format('H:i:s'),
                 'end_time' =>
-                    $newBookingEnd->format('H:i:s'),
+                    $shiftedBookingEnd->format('H:i:s'),
             ]);
 
-            /*
-            |--------------------------------------------------------------------------
-            | Update Booking Services
-            |--------------------------------------------------------------------------
-            */
-
-            foreach ($newBookingServices as $item) {
-
+            foreach ($updates as $item) {
                 BookingServiceModel::query()
-                    ->where(
-                        'id',
-                        $item['id']
-                    )
-                    ->where(
-                        'booking_id',
-                        $booking->id
-                    )
+                    ->whereKey($item['id'])
+                    ->where('booking_id', $booking->id)
                     ->update([
-                        'start_time' =>
-                            $item['start_time'],
-
-                        'end_time' =>
-                            $item['end_time'],
+                        'start_time' => $item['start_time'],
+                        'end_time' => $item['end_time'],
                     ]);
             }
 
             /*
             |--------------------------------------------------------------------------
-            | Release Old Active Holds
+            | Release Old Holds
             |--------------------------------------------------------------------------
             */
 
             BookingHold::query()
-                ->where(
-                    'booking_id',
-                    $booking->id
-                )
-                ->where(
-                    'status',
-                    'active'
-                )
+                ->where('booking_id', $booking->id)
+                ->where('status', 'active')
                 ->update([
                     'status' => 'released',
                 ]);
-
-            /*
-            |--------------------------------------------------------------------------
-            | Refresh Booking
-            |--------------------------------------------------------------------------
-            */
 
             $booking->refresh();
 
             /*
             |--------------------------------------------------------------------------
-            | Client Notification
+            | Notification
             |--------------------------------------------------------------------------
             */
 
             $booking->notifications()->create([
                 'user_id' => null,
-                'client_id' => $booking->client_id,
+                'client_id' => $clientId,
                 'type' => 'booking_rescheduled',
                 'title' => 'Booking Rescheduled',
                 'message' =>
                     'Your booking has been rescheduled to '
-                    . $booking->booking_date->format('Y-m-d')
+                    . $newDate
                     . ' at '
-                    . Carbon::createFromFormat(
-                        'H:i:s',
-                        $booking->start_time
-                    )->format('H:i')
+                    . $newStart->format('H:i')
                     . '.',
                 'is_read' => false,
                 'read_at' => null,
             ]);
-            /*
-|--------------------------------------------------------------------------
-| Booking Rescheduled SMS
-|--------------------------------------------------------------------------
-*/
-
-            $client = $booking->client;
-
-            if ($client && !empty($client->phone)) {
-
-                try {
-                    app(SmsService::class)->sendBookingRescheduled(
-                        phone: $client->phone,
-
-                        date: Jalalian::fromCarbon(
-                            $booking->booking_date
-                        )->format('Y/m/d'),
-
-                        time: Carbon::createFromFormat(
-                            'H:i:s',
-                            $booking->start_time
-                        )->format('H:i'),
-
-                        booking: $booking,
-                        client: $client
-                    );
-
-                } catch (\Throwable $e) {
-
-                    Log::error('Booking rescheduled SMS failed', [
-                        'booking_id' => $booking->id,
-                        'client_id' => $client->id,
-                        'error' => $e->getMessage(),
-                    ]);
-                }
-            }
 
             /*
             |--------------------------------------------------------------------------
-            | Accounting Audit Log
+            | Audit Log
             |--------------------------------------------------------------------------
             */
 
-            AccountingAuditLog::create([
-                'user_id' =>
-                    null,
-
-                'action' =>
-                    'booking_rescheduled',
-
-                'entity_type' =>
-                    'booking',
-
-                'entity_id' =>
-                    $booking->id,
-
-                'booking_id' =>
-                    $booking->id,
-
-                'client_id' =>
-                    $booking->client_id,
-
-                'description' =>
-                    'Booking rescheduled by client.',
-
-                'old_values' =>
-                    $oldValues,
-
-                'new_values' => [
-                    'booking_date' =>
-                        $booking->booking_date->format('Y-m-d'),
-
-                    'start_time' =>
-                        $booking->start_time,
-
-                    'end_time' =>
-                        $booking->end_time,
-
-                    'status' =>
-                        $booking->status,
-
+            $this->audit(
+                $booking,
+                'booking_rescheduled',
+                'Booking rescheduled by client.',
+                $oldValues,
+                [
+                    'booking_date' => $newDate,
+                    'start_time' => $booking->start_time,
+                    'end_time' => $booking->end_time,
+                    'status' => $booking->status,
                     'payment_status' =>
                         $booking->payment_status,
-
                     'paid_amount' =>
                         (float) $booking->paid_amount,
+                    'services' => $updates,
+                ]
+            );
 
-                    'services' =>
-                        $newBookingServices,
-                ],
+            $this->sendSmsAfterCommit(
+                $booking->id,
+                'booking_rescheduled'
+            );
 
-                'ip_address' =>
-                    request()?->ip(),
+            return $booking->load(self::RELATIONS);
 
-                'user_agent' =>
-                    request()?->userAgent(),
+        }, 3);
+    }
 
-                'created_at' =>
-                    now(),
+    /*
+    |--------------------------------------------------------------------------
+    | Database Locks
+    |--------------------------------------------------------------------------
+    */
+
+    private function lockClient(int $clientId): void
+    {
+        $exists = DB::table('clients')
+            ->where('id', $clientId)
+            ->lockForUpdate()
+            ->first(['id']);
+
+        if (!$exists) {
+            throw ValidationException::withMessages([
+                'client' => 'Patient not found.',
             ]);
+        }
+    }
 
-            /*
-            |--------------------------------------------------------------------------
-            | Return Booking
-            |--------------------------------------------------------------------------
-            */
+    private function lockStaff(array $staffIds): void
+    {
+        $ids = collect($staffIds)
+            ->map(fn ($id) => (int) $id)
+            ->filter(fn ($id) => $id > 0)
+            ->unique()
+            ->sort()
+            ->values();
 
-            return $booking->fresh([
-                'bookingServices.service',
-                'bookingServices.staff',
-                'payments',
+        if ($ids->isEmpty()) {
+            return;
+        }
+
+        $found = Staff::query()
+            ->whereIn('id', $ids->all())
+            ->orderBy('id')
+            ->lockForUpdate()
+            ->get(['id']);
+
+        if ($found->count() !== $ids->count()) {
+            throw ValidationException::withMessages([
+                'staff' =>
+                    'One or more selected staff members do not exist.',
             ]);
+        }
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Date Validation
+    |--------------------------------------------------------------------------
+    */
+
+    private function strictDateTime(
+        string $date,
+        string $time,
+        string $field
+    ): Carbon {
+        $dateTime = $date . ' ' . (
+            strlen($time) === 5
+                ? $time . ':00'
+                : $time
+            );
+
+        try {
+            $value = Carbon::createFromFormat(
+                '!Y-m-d H:i:s',
+                $dateTime
+            );
+        } catch (\Throwable $e) {
+            throw ValidationException::withMessages([
+                $field => 'Invalid date or time.',
+            ]);
+        }
+
+        if (
+            !$value ||
+            $value->format('Y-m-d H:i:s') !== $dateTime
+        ) {
+            throw ValidationException::withMessages([
+                $field => 'Invalid date or time.',
+            ]);
+        }
+
+        return $value;
+    }
+
+    private function bookingStart(
+        Booking $booking
+    ): Carbon {
+        return $this->strictDateTime(
+            $booking->booking_date->format('Y-m-d'),
+            $booking->start_time,
+            'booking'
+        );
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Accounting Audit Log
+    |--------------------------------------------------------------------------
+    */
+
+    private function audit(
+        Booking $booking,
+        string $action,
+        string $description,
+        array $oldValues,
+        array $newValues
+    ): void {
+        AccountingAuditLog::create([
+            'user_id' => null,
+            'action' => $action,
+            'entity_type' => 'booking',
+            'entity_id' => $booking->id,
+            'booking_id' => $booking->id,
+            'client_id' => $booking->client_id,
+            'description' => $description,
+            'old_values' => $oldValues,
+            'new_values' => $newValues,
+            'ip_address' => request()?->ip(),
+            'user_agent' => request()?->userAgent(),
+            'created_at' => now(),
+        ]);
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | SMS After Transaction Commit
+    |--------------------------------------------------------------------------
+    */
+
+    private function sendSmsAfterCommit(
+        int $bookingId,
+        string $type
+    ): void {
+        DB::afterCommit(function () use (
+            $bookingId,
+            $type
+        ) {
+            try {
+                $booking = Booking::with('client')
+                    ->find($bookingId);
+
+                $client = $booking?->client;
+
+                if (
+                    !$booking ||
+                    !$client ||
+                    empty($client->phone)
+                ) {
+                    return;
+                }
+
+                // Keep duplicate guard for confirmation/cancellation.
+                if (
+                    $type !== 'booking_rescheduled' &&
+                    $booking->smsLogs()
+                        ->where('type', $type)
+                        ->where('status', 'sent')
+                        ->exists()
+                ) {
+                    return;
+                }
+
+                $params = [
+                    'phone' => $client->phone,
+                    'date' => Jalalian::fromCarbon(
+                        $booking->booking_date
+                    )->format('Y/m/d'),
+                    'time' => substr(
+                        $booking->start_time,
+                        0,
+                        5
+                    ),
+                    'booking' => $booking,
+                    'client' => $client,
+                ];
+
+                $sms = app(SmsService::class);
+
+                switch ($type) {
+                    case 'booking_confirmed':
+                        $sms->sendBookingConfirmed(...$params);
+                        break;
+
+                    case 'booking_cancelled':
+                        $sms->sendBookingCancelled(...$params);
+                        break;
+
+                    case 'booking_rescheduled':
+                        $sms->sendBookingRescheduled(...$params);
+                        break;
+                }
+
+            } catch (\Throwable $e) {
+                Log::error('Booking SMS failed', [
+                    'booking_id' => $bookingId,
+                    'type' => $type,
+                    'error' => $e->getMessage(),
+                ]);
+            }
         });
     }
 }
-

@@ -254,11 +254,11 @@ class BookingResource extends Resource
                     )
                     ->sortable(),
 
-                Tables\Columns\TextColumn::make('start_time')
-                    ->label('شروع'),
-
-                Tables\Columns\TextColumn::make('end_time')
-                    ->label('پایان'),
+//                Tables\Columns\TextColumn::make('start_time')
+//                    ->label('شروع'),
+//
+//                Tables\Columns\TextColumn::make('end_time')
+//                    ->label('پایان'),
 
                 /*
                 |--------------------------------------------------------------------------
@@ -266,61 +266,61 @@ class BookingResource extends Resource
                 |--------------------------------------------------------------------------
                 */
 
-                Tables\Columns\TextColumn::make('subtotal')
-                    ->label('جمع قیمت خدمات')
-                    ->formatStateUsing(
-                        fn ($state) =>
-                            number_format((float) $state) . ' تومان'
-                    )
-                    ->sortable(),
-                Tables\Columns\TextColumn::make('has_discount')
-                    ->label('وضعیت تخفیف')
-                    ->state(
-                        fn (Booking $record): string =>
-                        (float) $record->discount_amount > 0
-                            ? 'دارای تخفیف'
-                            : 'بدون تخفیف'
-                    )
-                    ->badge()
-                    ->color(
-                        fn (string $state): string =>
-                        $state === 'دارای تخفیف'
-                            ? 'success'
-                            : 'gray'
-                    )
-                    ->icon(
-                        fn (string $state): string =>
-                        $state === 'دارای تخفیف'
-                            ? 'heroicon-o-check-circle'
-                            : 'heroicon-o-minus-circle'
-                    ),
-
-                Tables\Columns\TextColumn::make('discount_amount')
-                    ->label('مبلغ تخفیف')
-                    ->formatStateUsing(
-                        fn ($state) =>
-                            number_format((float) $state) . ' تومان'
-                    )
-                    ->color(
-                        fn ($state) =>
-                        (float) $state > 0 ? 'success' : 'gray'
-                    )
-                    ->sortable(),
-                Tables\Columns\TextColumn::make('total_amount')
-                    ->label('مبلغ نهایی')
-                    ->formatStateUsing(
-                        fn ($state) =>
-                            number_format((float) $state) . ' تومان'
-                    )
-                    ->sortable(),
-
-                Tables\Columns\TextColumn::make('deposit_amount')
-                    ->label('بیعانه')
-                    ->formatStateUsing(
-                        fn ($state) =>
-                            number_format((float) $state) . ' تومان'
-                    )
-                    ->sortable(),
+//                Tables\Columns\TextColumn::make('subtotal')
+//                    ->label('جمع قیمت خدمات')
+//                    ->formatStateUsing(
+//                        fn ($state) =>
+//                            number_format((float) $state) . ' تومان'
+//                    )
+//                    ->sortable(),
+//                Tables\Columns\TextColumn::make('has_discount')
+//                    ->label('وضعیت تخفیف')
+//                    ->state(
+//                        fn (Booking $record): string =>
+//                        (float) $record->discount_amount > 0
+//                            ? 'دارای تخفیف'
+//                            : 'بدون تخفیف'
+//                    )
+//                    ->badge()
+//                    ->color(
+//                        fn (string $state): string =>
+//                        $state === 'دارای تخفیف'
+//                            ? 'success'
+//                            : 'gray'
+//                    )
+//                    ->icon(
+//                        fn (string $state): string =>
+//                        $state === 'دارای تخفیف'
+//                            ? 'heroicon-o-check-circle'
+//                            : 'heroicon-o-minus-circle'
+//                    ),
+//
+//                Tables\Columns\TextColumn::make('discount_amount')
+//                    ->label('مبلغ تخفیف')
+//                    ->formatStateUsing(
+//                        fn ($state) =>
+//                            number_format((float) $state) . ' تومان'
+//                    )
+//                    ->color(
+//                        fn ($state) =>
+//                        (float) $state > 0 ? 'success' : 'gray'
+//                    )
+//                    ->sortable(),
+//                Tables\Columns\TextColumn::make('total_amount')
+//                    ->label('مبلغ نهایی')
+//                    ->formatStateUsing(
+//                        fn ($state) =>
+//                            number_format((float) $state) . ' تومان'
+//                    )
+//                    ->sortable(),
+//
+//                Tables\Columns\TextColumn::make('deposit_amount')
+//                    ->label('بیعانه')
+//                    ->formatStateUsing(
+//                        fn ($state) =>
+//                            number_format((float) $state) . ' تومان'
+//                    )
+//                    ->sortable(),
 
                 Tables\Columns\TextColumn::make('paid_amount')
                     ->label('پرداخت‌شده')
@@ -363,30 +363,30 @@ class BookingResource extends Resource
                 |--------------------------------------------------------------------------
                 */
 
-                Tables\Columns\TextColumn::make('overpaid_amount')
-                    ->label('اضافه‌پرداخت')
-                    ->state(
-                        fn (Booking $record): float => max(
-                            0,
-                            round(
-                                (float) $record->paid_amount
-                                - (float) $record->total_amount,
-                                2
-                            )
-                        )
-                    )
-                    ->formatStateUsing(
-                        fn ($state) =>
-                            number_format((float) $state) . ' تومان'
-                    )
-                    ->color(
-                        fn ($state) =>
-                        (float) $state > 0 ? 'warning' : 'gray'
-                    )
-                    ->weight(
-                        fn ($state) =>
-                        (float) $state > 0 ? 'bold' : 'normal'
-                    ),
+//                Tables\Columns\TextColumn::make('overpaid_amount')
+//                    ->label('اضافه‌پرداخت')
+//                    ->state(
+//                        fn (Booking $record): float => max(
+//                            0,
+//                            round(
+//                                (float) $record->paid_amount
+//                                - (float) $record->total_amount,
+//                                2
+//                            )
+//                        )
+//                    )
+//                    ->formatStateUsing(
+//                        fn ($state) =>
+//                            number_format((float) $state) . ' تومان'
+//                    )
+//                    ->color(
+//                        fn ($state) =>
+//                        (float) $state > 0 ? 'warning' : 'gray'
+//                    )
+//                    ->weight(
+//                        fn ($state) =>
+//                        (float) $state > 0 ? 'bold' : 'normal'
+//                    ),
 
                 /*
                 |--------------------------------------------------------------------------
@@ -477,17 +477,17 @@ class BookingResource extends Resource
                 |--------------------------------------------------------------------------
                 */
 
-                Tables\Columns\TextColumn::make('created_at')
-                    ->label('تاریخ ایجاد')
-                    ->formatStateUsing(
-                        fn ($state) => $state
-                            ? JalaliHelper::dateTime(
-                                $state,
-                                'Y/m/d H:i'
-                            )
-                            : '-'
-                    )
-                    ->sortable(),
+//                Tables\Columns\TextColumn::make('created_at')
+//                    ->label('تاریخ ایجاد')
+//                    ->formatStateUsing(
+//                        fn ($state) => $state
+//                            ? JalaliHelper::dateTime(
+//                                $state,
+//                                'Y/m/d H:i'
+//                            )
+//                            : '-'
+//                    )
+//                    ->sortable(),
 
             ])
 

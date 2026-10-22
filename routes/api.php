@@ -18,6 +18,9 @@ use App\Http\Controllers\Api\ServiceController;
 use App\Http\Controllers\Api\StaffController;
 use App\Http\Controllers\Api\ShortPaymentLinkController;
 use App\Http\Controllers\Api\DiscountCodeController;
+use App\Http\Controllers\Api\TreatmentPlanController;
+use App\Http\Controllers\Api\DentalRecordController;
+use App\Http\Controllers\Api\PatientFinanceController;
 
 
 /*
@@ -97,6 +100,7 @@ Route::prefix('v1')->group(function () {
         ]);
 
 
+
         /*
         |--------------------------------------------------------------------------
         | Refresh Token
@@ -155,7 +159,43 @@ Route::prefix('v1')->group(function () {
             ]);
         });
     });
+    /*
+    |--------------------------------------------------------------------------
+    | Patient Invoices
+    |--------------------------------------------------------------------------
+    */
 
+    Route::middleware('auth:api')
+        ->prefix('invoices')
+        ->group(function () {
+
+            Route::get('/', [
+                PatientFinanceController::class,
+                'invoices'
+            ]);
+
+            Route::get('/{id}', [
+                PatientFinanceController::class,
+                'invoiceDetails'
+            ])->whereNumber('id');
+
+        });
+    /*
+|--------------------------------------------------------------------------
+| Patient Finance Summary
+|--------------------------------------------------------------------------
+*/
+
+    Route::middleware('auth:api')
+        ->prefix('patient/finance')
+        ->group(function () {
+
+            Route::get('/summary', [
+                PatientFinanceController::class,
+                'summary'
+            ]);
+
+        });
     /*
         |--------------------------------------------------------------------------
         | services - Client Protected
@@ -214,6 +254,39 @@ Route::prefix('v1')->group(function () {
         });
 
 
+
+    /*
+    |--------------------------------------------------------------------------
+    | Patient Appointments
+    |--------------------------------------------------------------------------
+    */
+
+    Route::middleware('auth:api')
+        ->prefix('patient/appointments')
+        ->group(function () {
+
+            Route::get('/', [
+                BookingController::class,
+                'index'
+            ]);
+
+            Route::get('/{id}', [
+                BookingController::class,
+                'show'
+            ]);
+
+            Route::post('/{id}/cancel', [
+                BookingController::class,
+                'cancel'
+            ]);
+
+            Route::post('/{id}/reschedule', [
+                BookingController::class,
+                'reschedule'
+            ]);
+
+        });
+
     /*
     |--------------------------------------------------------------------------
     | Availability - Client Protected
@@ -232,29 +305,88 @@ Route::prefix('v1')->group(function () {
 
 
     /*
-    |--------------------------------------------------------------------------
-    | Payments - Client Protected
-    |--------------------------------------------------------------------------
-    */
+ |--------------------------------------------------------------------------
+ | Payments - Client Protected
+ |--------------------------------------------------------------------------
+ */
 
     Route::middleware('auth:api')
         ->prefix('payments')
         ->group(function () {
 
+            // Patient Payment History
+            Route::get('/', [
+                PatientFinanceController::class,
+                'payments'
+            ]);
+
+            // Patient Payment Details
+            Route::get('/{id}', [
+                PatientFinanceController::class,
+                'paymentDetails'
+            ])->whereNumber('id');
+
+            // Create Deposit Payment
             Route::post('/bookings/{bookingId}/deposit', [
                 PaymentController::class,
-                'deposit',
+                'deposit'
             ]);
 
+            // Start Deposit Payment
             Route::post('/bookings/{bookingId}/start', [
                 PaymentController::class,
-                'start',
+                'start'
             ]);
 
-            Route::post('/bookings/{bookingId}/remaining', [PaymentController::class, 'remaining']);
-            Route::post('/bookings/{bookingId}/remaining/start', [PaymentController::class, 'remainingStart']);
+            // Create Remaining Payment
+            Route::post('/bookings/{bookingId}/remaining', [
+                PaymentController::class,
+                'remaining'
+            ]);
+
+            // Start Remaining Payment
+            Route::post('/bookings/{bookingId}/remaining/start', [
+                PaymentController::class,
+                'remainingStart'
+            ]);
+            Route::get('/{id}/status', [
+                PatientFinanceController::class,
+                'paymentStatus'
+            ])->whereNumber('id');
         });
 
+
+    /*
+|--------------------------------------------------------------------------
+| Patient Treatment Plans
+|--------------------------------------------------------------------------
+*/
+
+    Route::middleware('auth:api')
+        ->prefix('treatment-plans')
+        ->group(function () {
+
+            Route::get('/', [
+                TreatmentPlanController::class,
+                'index'
+            ]);
+
+            Route::get('/{id}', [
+                TreatmentPlanController::class,
+                'show'
+            ])->whereNumber('id');
+
+            Route::get('/{id}/items', [
+                TreatmentPlanController::class,
+                'items'
+            ])->whereNumber('id');
+
+            Route::get('/{id}/progress', [
+                TreatmentPlanController::class,
+                'progress'
+            ])->whereNumber('id');
+
+        });
 
     /*
     |--------------------------------------------------------------------------
@@ -312,7 +444,52 @@ Route::prefix('v1')->group(function () {
         ]);
     });
 
+    /*
+    |--------------------------------------------------------------------------
+    | Patient Dental Records
+    |--------------------------------------------------------------------------
+    */
 
+    Route::middleware('auth:api')
+        ->prefix('dental-records')
+        ->group(function () {
+
+            Route::get('/', [
+                DentalRecordController::class,
+                'index'
+            ]);
+
+            Route::get('/{id}/treatments', [
+                DentalRecordController::class,
+                'treatments'
+            ])->whereNumber('id');
+
+            Route::get('/{id}/odontogram', [
+                DentalRecordController::class,
+                'odontogram'
+            ])->whereNumber('id');
+
+            Route::get('/{id}/attachments', [
+                DentalRecordController::class,
+                'attachments'
+            ])->whereNumber('id');
+
+            Route::get('/{id}', [
+                DentalRecordController::class,
+                'show'
+            ])->whereNumber('id');
+            Route::get(
+                '/{id}/attachments/{attachmentId}/download',
+                [DentalRecordController::class, 'downloadAttachment']
+            )->whereNumber('id')
+                ->whereNumber('attachmentId');
+            Route::get(
+                '/{id}/attachments/{attachmentId}/view',
+                [DentalRecordController::class, 'viewAttachment']
+            )->whereNumber('id')
+                ->whereNumber('attachmentId');
+
+        });
     /*
     |--------------------------------------------------------------------------
     | Notifications - Client Protected
@@ -459,6 +636,7 @@ Route::middleware('auth:operator')
 
 
 
+
 Route::middleware('auth:api')->prefix('v1')->group(function () {
 
     Route::post(
@@ -472,3 +650,4 @@ Route::get(
     '/v1/payments/resolve/{token}',
     [ShortPaymentLinkController::class, 'resolve']
 )->middleware('throttle:30,1');
+

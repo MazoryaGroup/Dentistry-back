@@ -16,295 +16,103 @@ class BookingAvailabilityService
         int $interval = 30,
         ?int $ignoreBookingId = null
     ): Collection {
+        if ($duration <= 0 || $interval <= 0) {
+            return collect();
+        }
+
         $staff = Staff::with([
             'schedules',
             'breaks',
             'leaves',
         ])->findOrFail($staffId);
 
-        $dateObject = Carbon::createFromFormat('Y-m-d', $date);
-
-        $dayOfWeek = $dateObject->dayOfWeek;
-
         if (!$staff->is_active) {
             return collect();
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | Schedules
-        |--------------------------------------------------------------------------
-        */
+        $dateObject = Carbon::createFromFormat(
+            '!Y-m-d',
+            $date
+        );
 
         $schedules = $staff->schedules
-            ->where('day_of_week', $dayOfWeek)
+            ->where('day_of_week', $dateObject->dayOfWeek)
             ->where('is_active', true)
-            ->sortBy('start_time')
-            ->values();
+            ->sortBy('start_time');
 
         if ($schedules->isEmpty()) {
             return collect();
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | Full Day Leave
-        |--------------------------------------------------------------------------
-        */
+        $bookings = $this->bookingsFor(
+            $staffId,
+            $date,
+            $ignoreBookingId
+        );
 
-        $fullDayLeave = $staff->leaves
-            ->where('is_active', true)
-            ->filter(function ($leave) use ($date) {
-                return $leave->leave_date
-                    && $leave->leave_date->format('Y-m-d') === $date
-                    && is_null($leave->start_time)
-                    && is_null($leave->end_time);
-            })
-            ->isNotEmpty();
+        $holds = $this->holdsFor(
+            $staff,
+            $date,
+            $ignoreBookingId
+        );
 
-        if ($fullDayLeave) {
-            return collect();
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Partial Leaves
-        |--------------------------------------------------------------------------
-        */
-
-        $leaves = $staff->leaves
-            ->where('is_active', true)
-            ->filter(function ($leave) use ($date) {
-                return $leave->leave_date
-                    && $leave->leave_date->format('Y-m-d') === $date
-                    && !is_null($leave->start_time)
-                    && !is_null($leave->end_time);
-            })
-            ->values();
-
-        /*
-        |--------------------------------------------------------------------------
-        | Breaks
-        |--------------------------------------------------------------------------
-        */
-
-        $breaks = $staff->breaks
-            ->where('day_of_week', $dayOfWeek)
-            ->where('is_active', true)
-            ->values();
-
-        /*
-        |--------------------------------------------------------------------------
-        | Existing Bookings
-        |--------------------------------------------------------------------------
-        */
-
-        $existingBookings = BookingServiceModel::query()
-            ->where('staff_id', $staffId)
-            ->whereHas('booking', function ($query) use ($date, $ignoreBookingId) {
-
-                $query
-                    ->whereDate('booking_date', $date)
-                    ->whereNotIn('status', [
-                        'cancelled',
-                        'rejected',
-                        'no_show',
-                    ]);
-
-                if ($ignoreBookingId) {
-                    $query->where('id', '!=', $ignoreBookingId);
-                }
-            })
-            ->get();
-
-        /*
-        |--------------------------------------------------------------------------
-        | Active Holds
-        |--------------------------------------------------------------------------
-        */
-
-        $activeHolds = $staff->bookingHolds()
-            ->whereDate('hold_date', $date)
-            ->where('status', 'active')
-            ->where('expires_at', '>', now())
-            ->get();
-
-        /*
-        |--------------------------------------------------------------------------
-        | Generate Slots
-        |--------------------------------------------------------------------------
-        */
-
-        $availableSlots = collect();
+        $slots = collect();
 
         foreach ($schedules as $schedule) {
-
-            $scheduleStart = Carbon::createFromFormat(
-                'Y-m-d H:i:s',
-                $date . ' ' . $schedule->start_time
+            $scheduleStart = $this->at(
+                $date,
+                $schedule->start_time
             );
 
-            $scheduleEnd = Carbon::createFromFormat(
-                'Y-m-d H:i:s',
-                $date . ' ' . $schedule->end_time
+            $scheduleEnd = $this->at(
+                $date,
+                $schedule->end_time
             );
+
+            if ($scheduleEnd->lte($scheduleStart)) {
+                continue;
+            }
 
             $current = $scheduleStart->copy();
 
             while (
-            $current->copy()->addMinutes($duration)->lte($scheduleEnd)
+            $current->copy()
+                ->addMinutes($duration)
+                ->lte($scheduleEnd)
             ) {
-                $slotStart = $current->copy();
-
-                $slotEnd = $current
-                    ->copy()
-                    ->addMinutes($duration);
-
-                /*
-                |--------------------------------------------------------------------------
-                | Break
-                |--------------------------------------------------------------------------
-                */
-
-                $overlapsBreak = $breaks->contains(
-                    function ($break) use ($date, $slotStart, $slotEnd) {
-
-                        $breakStart = Carbon::createFromFormat(
-                            'Y-m-d H:i:s',
-                            $date . ' ' . $break->start_time
-                        );
-
-                        $breakEnd = Carbon::createFromFormat(
-                            'Y-m-d H:i:s',
-                            $date . ' ' . $break->end_time
-                        );
-
-                        return $slotStart->lt($breakEnd)
-                            && $slotEnd->gt($breakStart);
-                    }
-                );
-
-                if ($overlapsBreak) {
-                    $current->addMinutes($interval);
-                    continue;
-                }
-
-                /*
-                |--------------------------------------------------------------------------
-                | Leave
-                |--------------------------------------------------------------------------
-                */
-
-                $overlapsLeave = $leaves->contains(
-                    function ($leave) use ($date, $slotStart, $slotEnd) {
-
-                        $leaveStart = Carbon::createFromFormat(
-                            'Y-m-d H:i:s',
-                            $date . ' ' . $leave->start_time
-                        );
-
-                        $leaveEnd = Carbon::createFromFormat(
-                            'Y-m-d H:i:s',
-                            $date . ' ' . $leave->end_time
-                        );
-
-                        return $slotStart->lt($leaveEnd)
-                            && $slotEnd->gt($leaveStart);
-                    }
-                );
-
-                if ($overlapsLeave) {
-                    $current->addMinutes($interval);
-                    continue;
-                }
-
-                /*
-                |--------------------------------------------------------------------------
-                | Existing Booking
-                |--------------------------------------------------------------------------
-                */
-
-                $overlapsBooking = $existingBookings->contains(
-                    function (BookingServiceModel $bookingService) use (
-                        $date,
-                        $slotStart,
-                        $slotEnd
-                    ) {
-
-                        $bookingStart = Carbon::createFromFormat(
-                            'Y-m-d H:i:s',
-                            $date . ' ' . $bookingService->start_time
-                        );
-
-                        $bookingEnd = Carbon::createFromFormat(
-                            'Y-m-d H:i:s',
-                            $date . ' ' . $bookingService->end_time
-                        );
-
-                        return $slotStart->lt($bookingEnd)
-                            && $slotEnd->gt($bookingStart);
-                    }
-                );
-
-                if ($overlapsBooking) {
-                    $current->addMinutes($interval);
-                    continue;
-                }
-
-                /*
-                |--------------------------------------------------------------------------
-                | Active Hold
-                |--------------------------------------------------------------------------
-                */
-
-                $overlapsHold = $activeHolds->contains(
-                    function ($hold) use (
-                        $date,
-                        $slotStart,
-                        $slotEnd
-                    ) {
-
-                        $holdStart = Carbon::createFromFormat(
-                            'Y-m-d H:i:s',
-                            $date . ' ' . $hold->start_time
-                        );
-
-                        $holdEnd = Carbon::createFromFormat(
-                            'Y-m-d H:i:s',
-                            $date . ' ' . $hold->end_time
-                        );
-
-                        return $slotStart->lt($holdEnd)
-                            && $slotEnd->gt($holdStart);
-                    }
-                );
-
-                if ($overlapsHold) {
-                    $current->addMinutes($interval);
-                    continue;
-                }
-
-                /*
-                |--------------------------------------------------------------------------
-                | Available
-                |--------------------------------------------------------------------------
-                */
-
-                $availableSlots->push([
-                    'start_time' => $slotStart->format('H:i'),
-                    'end_time' => $slotEnd->format('H:i'),
-                    'duration' => $duration,
-                ]);
+                $start = $current->copy();
+                $end = $start->copy()->addMinutes($duration);
 
                 $current->addMinutes($interval);
+
+                // Do not return past time slots.
+                if ($start->lte(now())) {
+                    continue;
+                }
+
+                if (!$this->rangeIsAvailable(
+                    $staff,
+                    $date,
+                    $start,
+                    $end,
+                    $bookings,
+                    $holds
+                )) {
+                    continue;
+                }
+
+                $slots->push([
+                    'start_time' => $start->format('H:i'),
+                    'end_time' => $end->format('H:i'),
+                    'duration' => $duration,
+                ]);
             }
         }
 
-        return $availableSlots
+        return $slots
             ->unique('start_time')
             ->values();
     }
-
 
     public function isTimeAvailable(
         int $staffId,
@@ -315,7 +123,6 @@ class BookingAvailabilityService
         ?int $ignoreBookingServiceId = null,
         ?int $ignoreHoldBookingId = null
     ): bool {
-
         $staff = Staff::with([
             'schedules',
             'breaks',
@@ -326,170 +133,47 @@ class BookingAvailabilityService
             return false;
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | Date and Time
-        |--------------------------------------------------------------------------
-        */
+        $start = $this->at($date, $startTime);
+        $end = $this->at($date, $endTime);
 
-        $dateObject = Carbon::createFromFormat(
-            'Y-m-d',
-            $date
+        if (
+            $end->lte($start) ||
+            $start->lte(now())
+        ) {
+            return false;
+        }
+
+        $bookings = $this->bookingsFor(
+            $staffId,
+            $date,
+            $ignoreBookingId,
+            $ignoreBookingServiceId
         );
 
-        $dayOfWeek = $dateObject->dayOfWeek;
-
-        $requestedStart = Carbon::createFromFormat(
-            'Y-m-d H:i:s',
-            $date . ' ' . $startTime
+        $holds = $this->holdsFor(
+            $staff,
+            $date,
+            $ignoreHoldBookingId
         );
 
-        $requestedEnd = Carbon::createFromFormat(
-            'Y-m-d H:i:s',
-            $date . ' ' . $endTime
+        return $this->rangeIsAvailable(
+            $staff,
+            $date,
+            $start,
+            $end,
+            $bookings,
+            $holds
         );
+    }
 
-        if ($requestedEnd->lte($requestedStart)) {
-            return false;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Working Schedule
-        |--------------------------------------------------------------------------
-        */
-
-        $insideSchedule = $staff->schedules
-            ->where('day_of_week', $dayOfWeek)
-            ->where('is_active', true)
-            ->contains(function ($schedule) use (
-                $date,
-                $requestedStart,
-                $requestedEnd
-            ) {
-
-                $scheduleStart = Carbon::createFromFormat(
-                    'Y-m-d H:i:s',
-                    $date . ' ' . $schedule->start_time
-                );
-
-                $scheduleEnd = Carbon::createFromFormat(
-                    'Y-m-d H:i:s',
-                    $date . ' ' . $schedule->end_time
-                );
-
-                return $requestedStart->gte($scheduleStart)
-                    && $requestedEnd->lte($scheduleEnd);
-            });
-
-        if (!$insideSchedule) {
-            return false;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Full Day Leave
-        |--------------------------------------------------------------------------
-        */
-
-        $fullDayLeave = $staff->leaves
-            ->where('is_active', true)
-            ->contains(function ($leave) use ($date) {
-
-                return $leave->leave_date
-                    && $leave->leave_date->format('Y-m-d') === $date
-                    && is_null($leave->start_time)
-                    && is_null($leave->end_time);
-            });
-
-        if ($fullDayLeave) {
-            return false;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Partial Leave
-        |--------------------------------------------------------------------------
-        */
-
-        $overlapsLeave = $staff->leaves
-            ->where('is_active', true)
-            ->contains(function ($leave) use (
-                $date,
-                $requestedStart,
-                $requestedEnd
-            ) {
-
-                if (
-                    !$leave->leave_date ||
-                    $leave->leave_date->format('Y-m-d') !== $date ||
-                    is_null($leave->start_time) ||
-                    is_null($leave->end_time)
-                ) {
-                    return false;
-                }
-
-                $leaveStart = Carbon::createFromFormat(
-                    'Y-m-d H:i:s',
-                    $date . ' ' . $leave->start_time
-                );
-
-                $leaveEnd = Carbon::createFromFormat(
-                    'Y-m-d H:i:s',
-                    $date . ' ' . $leave->end_time
-                );
-
-                return $requestedStart->lt($leaveEnd)
-                    && $requestedEnd->gt($leaveStart);
-            });
-
-        if ($overlapsLeave) {
-            return false;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Staff Breaks
-        |--------------------------------------------------------------------------
-        */
-
-        $overlapsBreak = $staff->breaks
-            ->where('day_of_week', $dayOfWeek)
-            ->where('is_active', true)
-            ->contains(function ($break) use (
-                $date,
-                $requestedStart,
-                $requestedEnd
-            ) {
-
-                $breakStart = Carbon::createFromFormat(
-                    'Y-m-d H:i:s',
-                    $date . ' ' . $break->start_time
-                );
-
-                $breakEnd = Carbon::createFromFormat(
-                    'Y-m-d H:i:s',
-                    $date . ' ' . $break->end_time
-                );
-
-                return $requestedStart->lt($breakEnd)
-                    && $requestedEnd->gt($breakStart);
-            });
-
-        if ($overlapsBreak) {
-            return false;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Existing Bookings
-        |--------------------------------------------------------------------------
-        */
-
-        $overlapsBooking = BookingServiceModel::query()
+    private function bookingsFor(
+        int $staffId,
+        string $date,
+        ?int $ignoreBookingId = null,
+        ?int $ignoreBookingServiceId = null
+    ): Collection {
+        return BookingServiceModel::query()
             ->where('staff_id', $staffId)
-
-            // Ignore only the booking service being edited.
             ->when(
                 $ignoreBookingServiceId !== null,
                 fn ($query) => $query->where(
@@ -498,68 +182,46 @@ class BookingAvailabilityService
                     $ignoreBookingServiceId
                 )
             )
-
-            ->whereHas('booking', function ($query) use (
-                $date,
-                $ignoreBookingId
-            ) {
-
-                $query
-                    ->whereDate('booking_date', $date)
-                    ->whereNotIn('status', [
-                        'cancelled',
-                        'rejected',
-                        'no_show',
-                    ]);
-
-                // Backward compatibility for existing callers.
-                if ($ignoreBookingId !== null) {
-                    $query->where(
-                        'id',
-                        '!=',
-                        $ignoreBookingId
-                    );
+            ->whereHas(
+                'booking',
+                function ($query) use (
+                    $date,
+                    $ignoreBookingId
+                ) {
+                    $query
+                        ->whereDate('booking_date', $date)
+                        ->whereNotIn('status', [
+                            'cancelled',
+                            'rejected',
+                            'no_show',
+                        ])
+                        ->when(
+                            $ignoreBookingId !== null,
+                            fn ($query) => $query->where(
+                                'id',
+                                '!=',
+                                $ignoreBookingId
+                            )
+                        );
                 }
-            })
+            )
+            ->get([
+                'id',
+                'staff_id',
+                'start_time',
+                'end_time',
+            ]);
+    }
 
-            ->get()
-
-            ->contains(function ($bookingService) use (
-                $date,
-                $requestedStart,
-                $requestedEnd
-            ) {
-
-                $bookingStart = Carbon::createFromFormat(
-                    'Y-m-d H:i:s',
-                    $date . ' ' . $bookingService->start_time
-                );
-
-                $bookingEnd = Carbon::createFromFormat(
-                    'Y-m-d H:i:s',
-                    $date . ' ' . $bookingService->end_time
-                );
-
-                return $requestedStart->lt($bookingEnd)
-                    && $requestedEnd->gt($bookingStart);
-            });
-
-        if ($overlapsBooking) {
-            return false;
-        }
-
-        /*
-        |--------------------------------------------------------------------------
-        | Active Booking Holds
-        |--------------------------------------------------------------------------
-        */
-
-        $overlapsHold = $staff->bookingHolds()
+    private function holdsFor(
+        Staff $staff,
+        string $date,
+        ?int $ignoreHoldBookingId
+    ): Collection {
+        return $staff->bookingHolds()
             ->whereDate('hold_date', $date)
             ->where('status', 'active')
             ->where('expires_at', '>', now())
-
-            // Ignore holds of the current booking if requested.
             ->when(
                 $ignoreHoldBookingId !== null,
                 fn ($query) => $query->where(
@@ -568,41 +230,152 @@ class BookingAvailabilityService
                     $ignoreHoldBookingId
                 )
             )
+            ->get();
+    }
 
-            ->get()
+    private function rangeIsAvailable(
+        Staff $staff,
+        string $date,
+        Carbon $start,
+        Carbon $end,
+        Collection $bookings,
+        Collection $holds
+    ): bool {
+        $dayOfWeek = $start->dayOfWeek;
 
-            ->contains(function ($hold) use (
+        // Check working schedule.
+        $insideSchedule = $staff->schedules
+            ->where('day_of_week', $dayOfWeek)
+            ->where('is_active', true)
+            ->contains(function ($schedule) use (
                 $date,
-                $requestedStart,
-                $requestedEnd
+                $start,
+                $end
             ) {
-
-                $holdStart = Carbon::createFromFormat(
-                    'Y-m-d H:i:s',
-                    $date . ' ' . $hold->start_time
+                $workStart = $this->at(
+                    $date,
+                    $schedule->start_time
                 );
 
-                $holdEnd = Carbon::createFromFormat(
-                    'Y-m-d H:i:s',
-                    $date . ' ' . $hold->end_time
+                $workEnd = $this->at(
+                    $date,
+                    $schedule->end_time
                 );
 
-                return $requestedStart->lt($holdEnd)
-                    && $requestedEnd->gt($holdStart);
+                return $start->gte($workStart)
+                    && $end->lte($workEnd);
             });
 
-        if ($overlapsHold) {
+        if (!$insideSchedule) {
             return false;
         }
 
-        /*
-        |--------------------------------------------------------------------------
-        | Available
-        |--------------------------------------------------------------------------
-        */
+        // Check full-day and partial leaves.
+        foreach (
+            $staff->leaves->where('is_active', true)
+            as $leave
+        ) {
+            if (
+                !$leave->leave_date ||
+                $leave->leave_date->format('Y-m-d') !== $date
+            ) {
+                continue;
+            }
+
+            if (
+                $leave->start_time === null &&
+                $leave->end_time === null
+            ) {
+                return false;
+            }
+
+            if (
+                $leave->start_time !== null &&
+                $leave->end_time !== null &&
+                $this->overlaps(
+                    $date,
+                    $start,
+                    $end,
+                    $leave->start_time,
+                    $leave->end_time
+                )
+            ) {
+                return false;
+            }
+        }
+
+        // Check weekly breaks.
+        foreach (
+            $staff->breaks
+                ->where('day_of_week', $dayOfWeek)
+                ->where('is_active', true)
+            as $break
+        ) {
+            if ($this->overlaps(
+                $date,
+                $start,
+                $end,
+                $break->start_time,
+                $break->end_time
+            )) {
+                return false;
+            }
+        }
+
+        // Check existing bookings.
+        foreach ($bookings as $bookingService) {
+            if ($this->overlaps(
+                $date,
+                $start,
+                $end,
+                $bookingService->start_time,
+                $bookingService->end_time
+            )) {
+                return false;
+            }
+        }
+
+        // Check active booking holds.
+        foreach ($holds as $hold) {
+            if ($this->overlaps(
+                $date,
+                $start,
+                $end,
+                $hold->start_time,
+                $hold->end_time
+            )) {
+                return false;
+            }
+        }
 
         return true;
     }
 
-}
+    private function overlaps(
+        string $date,
+        Carbon $start,
+        Carbon $end,
+        string $blockedStart,
+        string $blockedEnd
+    ): bool {
+        return $start->lt(
+                $this->at($date, $blockedEnd)
+            ) && $end->gt(
+                $this->at($date, $blockedStart)
+            );
+    }
 
+    private function at(
+        string $date,
+        string $time
+    ): Carbon {
+        $normalizedTime = strlen($time) === 5
+            ? $time . ':00'
+            : $time;
+
+        return Carbon::createFromFormat(
+            '!Y-m-d H:i:s',
+            $date . ' ' . $normalizedTime
+        );
+    }
+}

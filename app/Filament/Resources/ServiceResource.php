@@ -194,26 +194,26 @@ class ServiceResource extends Resource
             Forms\Components\Section::make('اطلاعات رزرو و قیمت')
                 ->schema([
 
-//                    Forms\Components\TextInput::make('duration')
-//                        ->label('مدت زمان (دقیقه)')
-//                        ->numeric()
-//                        ->minValue(1)
-//                        ->required()
-//                        ->default(60),
-//
-//                    Forms\Components\TextInput::make('price')
-//                        ->label('قیمت (تومان)')
-//                        ->numeric()
-//                        ->minValue(0)
-//                        ->required()
-//                        ->default(0),
-//
-//                    Forms\Components\TextInput::make('deposit_amount')
-//                        ->label('مبلغ بیعانه (تومان)')
-//                        ->numeric()
-//                        ->minValue(0)
-//                        ->required()
-//                        ->default(0),
+                    Forms\Components\TextInput::make('duration')
+                        ->label('مدت زمان (دقیقه)')
+                        ->numeric()
+                        ->minValue(1)
+                        ->required()
+                        ->default(60),
+
+                    Forms\Components\TextInput::make('price')
+                        ->label('قیمت (تومان)')
+                        ->numeric()
+                        ->minValue(0)
+                        ->required()
+                        ->default(0),
+
+                    Forms\Components\TextInput::make('deposit_amount')
+                        ->label('مبلغ بیعانه (تومان)')
+                        ->numeric()
+                        ->minValue(0)
+                        ->required()
+                        ->default(0),
 
                     Forms\Components\Toggle::make('is_active')
                         ->label('فعال')
@@ -251,19 +251,19 @@ class ServiceResource extends Resource
                                 ->distinct()
                                 ->required(),
 
-//                            Forms\Components\TextInput::make('duration')
-//                                ->label('مدت زمان (دقیقه)')
-//                                ->numeric()
-//                                ->minValue(1)
-//                                ->required()
-//                                ->default(60),
-//
-//                            Forms\Components\TextInput::make('price')
-//                                ->label('تعرفه پزشک (تومان)')
-//                                ->numeric()
-//                                ->minValue(0)
-//                                ->required()
-//                                ->default(0),
+                            Forms\Components\TextInput::make('duration')
+                                ->label('مدت زمان (دقیقه)')
+                                ->numeric()
+                                ->minValue(1)
+                                ->required()
+                                ->default(60),
+
+                            Forms\Components\TextInput::make('price')
+                                ->label('تعرفه پزشک (تومان)')
+                                ->numeric()
+                                ->minValue(0)
+                                ->required()
+                                ->default(0),
 
                             Forms\Components\Toggle::make('is_active')
                                 ->label('فعال')

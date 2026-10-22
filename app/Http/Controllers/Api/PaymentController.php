@@ -111,6 +111,8 @@ class PaymentController extends Controller
 
     public function start(Request $request, int $bookingId): JsonResponse
     {
+        $reservedPaymentId = null;
+
         try {
             $client = auth('api')->user();
 
@@ -135,6 +137,8 @@ class PaymentController extends Controller
                 ], 404);
             }
 
+            $this->validateGatewayConfiguration();
+
             /*
             |--------------------------------------------------------------------------
             | Reserve Deposit Initiation
@@ -148,6 +152,7 @@ class PaymentController extends Controller
                 );
 
             $payment = $reservation['payment'];
+            $reservedPaymentId = $payment->id;
             $token = $reservation['token'];
 
             /*
@@ -160,7 +165,7 @@ class PaymentController extends Controller
                 ->requestPayment(
                     amount: (float) $payment->amount,
                     callbackUrl: config('services.zarinpal.callback_url'),
-                    description: 'NIL booking deposit #' . $booking->id,
+                    description: 'Dentistry booking deposit #' . $booking->id,
                     email: $client->email,
                     mobile: $client->phone
                 );
@@ -208,31 +213,12 @@ class PaymentController extends Controller
                 ],
             ], 200);
 
-        } catch (RuntimeException $e) {
-
-            Log::warning('Deposit payment initiation rejected', [
-                'booking_id' => $bookingId,
-                'error' => $e->getMessage(),
-            ]);
-
-            return response()->json([
-                'success' => false,
-                'statusCode' => 422,
-                'message' => $e->getMessage(),
-            ], 422);
-
         } catch (Throwable $e) {
-
-            Log::error('Deposit payment initiation failed', [
-                'booking_id' => $bookingId,
-                'error' => $e->getMessage(),
-            ]);
-
-            return response()->json([
-                'success' => false,
-                'statusCode' => 500,
-                'message' => 'Failed to start deposit payment.',
-            ], 500);
+            return $this->handleInitiationFailure(
+                $e,
+                $bookingId,
+                $reservedPaymentId
+            );
         }
     }
 
@@ -331,6 +317,8 @@ class PaymentController extends Controller
         Request $request,
         int $bookingId
     ): JsonResponse {
+        $reservedPaymentId = null;
+
         try {
             $client = auth('api')->user();
 
@@ -355,6 +343,8 @@ class PaymentController extends Controller
                 ], 404);
             }
 
+            $this->validateGatewayConfiguration();
+
             /*
             |--------------------------------------------------------------------------
             | Reserve Payment Initiation
@@ -372,6 +362,7 @@ class PaymentController extends Controller
                 );
 
             $payment = $reservation['payment'];
+            $reservedPaymentId = $payment->id;
             $token = $reservation['token'];
 
             /*
@@ -387,7 +378,7 @@ class PaymentController extends Controller
                 ->requestPayment(
                     amount: (float) $payment->amount,
                     callbackUrl: config('services.zarinpal.callback_url'),
-                    description: 'NIL booking remaining payment #' . $booking->id,
+                    description: 'Dentistry booking remaining payment #' . $booking->id,
                     email: $client->email,
                     mobile: $client->phone
                 );
@@ -438,31 +429,12 @@ class PaymentController extends Controller
                 ],
             ], 200);
 
-        } catch (RuntimeException $e) {
-
-            Log::warning('Remaining payment initiation rejected', [
-                'booking_id' => $bookingId,
-                'error' => $e->getMessage(),
-            ]);
-
-            return response()->json([
-                'success' => false,
-                'statusCode' => 422,
-                'message' => $e->getMessage(),
-            ], 422);
-
         } catch (Throwable $e) {
-
-            Log::error('Remaining payment initiation failed', [
-                'booking_id' => $bookingId,
-                'error' => $e->getMessage(),
-            ]);
-
-            return response()->json([
-                'success' => false,
-                'statusCode' => 500,
-                'message' => 'Failed to start remaining payment.',
-            ], 500);
+            return $this->handleInitiationFailure(
+                $e,
+                $bookingId,
+                $reservedPaymentId
+            );
         }
     }
 
@@ -476,7 +448,7 @@ class PaymentController extends Controller
     public function callback(Request $request): RedirectResponse
     {
         $frontendUrl = rtrim(
-            (string) config('services.nil.frontend_url'),
+            (string) config('services.dentistry.frontend_url'),
             '/'
         );
 
@@ -658,6 +630,84 @@ class PaymentController extends Controller
         }
     }
 
+
+    /*
+    |--------------------------------------------------------------------------
+    | Validate Gateway Settings Before Payment Reservation
+    |--------------------------------------------------------------------------
+    */
+    private function validateGatewayConfiguration(): void
+    {
+        $merchantId = trim((string) config('services.zarinpal.merchant_id', ''));
+
+        if (
+            $merchantId === '' ||
+            in_array($merchantId, [
+                'YOUR_MERCHANT_ID',
+                'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx',
+            ], true)
+        ) {
+            throw new RuntimeException('ZarinPal merchant ID is not configured.');
+        }
+
+        $callbackUrl = trim((string) config('services.zarinpal.callback_url', ''));
+        $scheme = strtolower((string) parse_url($callbackUrl, PHP_URL_SCHEME));
+        $sandbox = filter_var(
+            config('services.zarinpal.sandbox', false),
+            FILTER_VALIDATE_BOOLEAN
+        );
+
+        if (
+            !filter_var($callbackUrl, FILTER_VALIDATE_URL) ||
+            !in_array($scheme, ['http', 'https'], true)
+        ) {
+            throw new RuntimeException('ZarinPal callback URL is invalid.');
+        }
+
+        if (!$sandbox && $scheme !== 'https') {
+            throw new RuntimeException('Production ZarinPal callback must use HTTPS.');
+        }
+    }
+
+    /*
+    |--------------------------------------------------------------------------
+    | Handle Uncertain Gateway Initiation (Do Not Auto-Retry)
+    |--------------------------------------------------------------------------
+    */
+    private function handleInitiationFailure(
+        Throwable $e,
+        int $bookingId,
+        ?int $reservedPaymentId
+    ): JsonResponse {
+        $requiresReview = $reservedPaymentId !== null;
+
+        Log::error('Payment initiation failed', [
+            'booking_id' => $bookingId,
+            'payment_id' => $reservedPaymentId,
+            'requires_review' => $requiresReview,
+            'exception' => get_class($e),
+            'error' => $e->getMessage(),
+        ]);
+
+        $statusCode = $requiresReview
+            ? 409
+            : ($e instanceof RuntimeException ? 422 : 500);
+
+        return response()->json([
+            'success' => false,
+            'statusCode' => $statusCode,
+            'message' => $requiresReview
+                ? 'Payment initiation requires review. Do not retry until resolved.'
+                : ($e instanceof RuntimeException
+                    ? $e->getMessage()
+                    : 'Failed to start payment.'),
+            'data' => $requiresReview ? [
+                'booking_id' => $bookingId,
+                'payment_id' => $reservedPaymentId,
+                'requires_review' => true,
+            ] : null,
+        ], $statusCode);
+    }
 
     /*
     |--------------------------------------------------------------------------
